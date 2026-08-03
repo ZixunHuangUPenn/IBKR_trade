@@ -1,0 +1,19 @@
+# NOTE: keep this file ASCII-only.
+# pip decodes requirements.txt with the system locale (GBK on zh-CN Windows),
+# so non-ASCII comments here will crash the install.
+
+# ---- IBKR connectivity ----
+# ib_async is the maintained successor to ib_insync (archived in 2024).
+ib_async>=1.0.3
+
+# ---- data ----
+pandas>=2.1
+numpy>=1.26
+pyarrow>=15.0
+
+# ---- dashboard ----
+streamlit>=1.35
+plotly>=5.20
+
+# ---- misc ----
+python-dotenv>=1.0

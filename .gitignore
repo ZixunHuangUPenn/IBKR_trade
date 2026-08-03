@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.py[cod]
+
+# 密钥和本地配置，绝对不能提交
+.env
+
+# 数据和结果：体积大、可重新生成、而且账户快照含隐私
+data/
+
+.vscode/
+.idea/
+.DS_Store
