@@ -217,6 +217,21 @@ Get-ScheduledTaskInfo -TaskName IBKR-Signal | Select LastRunTime,LastTaskResult
 | 昨天的限价单没成交还挂着 | 下单前先 `cancel_all`，否则会和今天的新单叠成超额仓位 |
 | 下完单仓位没到位 | `ibkr/reconcile.py` 对账，偏差超容忍度就告警（**只告警，不自动补单**） |
 | 上次还没跑完又到点了 | 任务的 `MultipleInstances IgnoreNew` |
+| 今天不是策略的调仓日 | signal 阶段记录 `rebalance_day`，trade 阶段遵守（见下） |
+
+### 实盘必须遵守策略自己的调仓日历
+
+策略用 `rebalance_mask()` 声明什么时候可以调仓（横截面动量是月末）。回测严格遵守它，
+**实盘不遵守的话，跑的就不是被回测过的那个策略**。实测差距：
+
+```
+横截面动量，月末调仓        年换手  359%
+同一策略，日频 + 1% 带宽    年换手 2222%     ← 差 6.2 倍
+```
+
+收益上几乎看不出区别，成本上差一个数量级 —— 这种偏差最难被发现。
+所以 signal 阶段把 `rebalance_day` 写进信号，trade 阶段照办。
+想每天都调就加 `--ignore-calendar`，但那之后回测结果就不再代表实盘了。
 
 对账刻意不自动补单：自动补单的循环一旦写错（比如价格取错导致反复下单），损失不封顶。
 发现偏差先告警、让人看一眼，这个决定值得为它承受一点麻烦。
@@ -228,6 +243,34 @@ Get-ScheduledTaskInfo -TaskName IBKR-Signal | Select LastRunTime,LastTaskResult
 
 > 无人值守最危险的失败模式不是"崩了"，是"静悄悄地什么也没做"。
 > 任务计划器里那个 `LastTaskResult` 你不会每天去看。
+
+### 让 Gateway 自己起来（IBC）
+
+Gateway 是 GUI 程序，关掉了就没人再打开它 —— 这是"忘了开 Gateway 导致当天没跑"的根源。
+[IbcAlpha/IBC](https://github.com/IbcAlpha/IBC) 负责自动填账号密码、自动点掉那些
+会卡住登录的弹窗（"接受协议"、"版本过期"）。那些弹窗最阴险：进程活着、端口不监听，
+你的作业只看到"连不上"。
+
+本机已装在 `C:\IBC`，关键配置：
+
+```ini
+TradingMode=paper                       # 上实盘要改成 live
+OverrideTwsApiPort=4002                 # 实盘 Gateway 是 4001
+ReadOnlyApi=no                          # 显式允许下单，不依赖 GUI 里的勾选状态
+AutoRestartTime=03:00 AM
+ExistingSessionDetectedAction=primary   # 别被其他登录挤掉
+AcceptIncomingConnectionAction=accept   # 不弹 API 连接确认框
+IbLoginId= / IbPassword=                # 自己填
+```
+
+自启与自愈由两件东西负责：
+
+- 启动文件夹的 `IBC Gateway.lnk` —— 登录后立刻拉起
+- 计划任务 `IBC-Gateway` —— 每 15 分钟检查一次，`MultipleInstances=IgnoreNew`
+  意味着还活着就跳过，崩了才会重新拉起
+
+> ⚠️ `config.ini` 里是**明文密码**。文件 ACL 已收窄到当前用户，但这台机器的安全
+> 就等于你的 IBKR 安全。上实盘前给 Gateway 单独建一个 IBKR username。
 
 ### 关于机器和登录
 

@@ -73,6 +73,11 @@ def setup_logging(stage: str) -> Path:
     sh = logging.StreamHandler(sys.stdout)
     sh.setFormatter(fmt)
     root.addHandler(sh)
+
+    # ib_async 在 INFO 级别会把整个 Trade 对象（含全部 fills 和状态流水）打进日志。
+    # 实测一次三笔的调仓产生 96 KB，其中 89 KB 是这个 —— 你要看的东西被彻底淹掉。
+    # 日志是出事之后唯一的证据，可读性不是锦上添花。
+    logging.getLogger("ib_async").setLevel(logging.WARNING)
     return path
 
 
@@ -121,6 +126,13 @@ def stage_signal(args) -> int:
     weights = {k: round(float(v), 6)
                for k, v in strat.latest_weights(prices).items() if abs(v) > 1e-9}
 
+    # 策略自己声明的调仓日历。回测严格遵守它（run_backtest 的 rebalance_mask），
+    # 实盘不遵守的话，跑的就不是被回测过的那个策略 ——
+    # 横截面动量实测：月末调仓年换手 359%，改成日频+1%带宽是 2222%，差 6 倍多。
+    # 这种偏差不会体现在收益上，只会体现在成本上，所以特别难被发现。
+    mask = strat.rebalance_mask(prices.index)
+    rebalance_day = True if mask is None else bool(mask.iloc[-1])
+
     payload = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "signal_date": str(last_bar),
@@ -129,12 +141,14 @@ def stage_signal(args) -> int:
         "label": strat.label,
         "universe": symbols,
         "weights": weights,
+        "rebalance_day": rebalance_day,
         "ref_close": {s: round(float(prices[s].iloc[-1]), 4)
                       for s in prices.columns},
     }
 
     ranked = sorted(weights.items(), key=lambda x: -x[1])
-    log.info("策略 %s | 信号日 %s | 目标权重: %s", strat.label, last_bar,
+    log.info("策略 %s | 信号日 %s | 调仓日=%s | 目标权重: %s", strat.label, last_bar,
+             "是" if rebalance_day else "否",
              {k: f"{v:.2%}" for k, v in ranked} or "（空仓）")
 
     if args.dry_run:
@@ -192,6 +206,23 @@ def _live_prices(ib, symbols: list[str], fallback: dict[str, float]) -> dict[str
     return out
 
 
+def _archive(sig: dict, signal_date, **extra) -> None:
+    """
+    消费信号：写归档 + 清空 pending。
+
+    "不交易"也必须消费。否则明天 pending 里还躺着今天的旧信号，
+    而新的信号又会把它覆盖 —— 两种情况下 pending 的语义都不再是
+    "待执行的最新信号"，后面所有的年龄检查就都失去意义了。
+    """
+    archive = config.SIGNAL_DIR / f"{signal_date}_{sig['strategy']}.json"
+    sig["consumed_at"] = datetime.now(timezone.utc).isoformat()
+    sig.update(extra)
+    archive.write_text(json.dumps(sig, indent=2, ensure_ascii=False, default=str),
+                       encoding="utf-8")
+    PENDING.unlink()
+    log.info("信号已归档到 %s，pending 已清空。", archive.name)
+
+
 def stage_trade(args) -> int:
     now_et = datetime.now(ET)
     log.info("trade 阶段启动，美东时间 %s", now_et.strftime("%Y-%m-%d %H:%M"))
@@ -230,6 +261,17 @@ def stage_trade(args) -> int:
     log.info("待执行信号：%s | 信号日 %s（%d 天前）| 目标 %s",
              sig["label"], signal_date, age,
              {k: f"{v:.2%}" for k, v in target.items()} or "（空仓）")
+
+    # 遵守策略自己的调仓日历。不遵守的话，实盘跑的就不是被回测过的那个策略：
+    # 横截面动量按月末调仓年换手 359%，按日频+1%带宽是 2222%。
+    # 收益看不出差别，成本差 6 倍 —— 这种偏差最难被发现。
+    if not sig.get("rebalance_day", True) and not args.ignore_calendar:
+        log.info("策略 %s 的调仓日历说信号日 %s 不是调仓日，今天不交易。"
+                 "（要覆盖它加 --ignore-calendar，但先想清楚回测还算不算数）",
+                 sig["label"], signal_date)
+        if args.execute:
+            _archive(sig, signal_date, skipped="非调仓日")
+        return 0
 
     if args.execute and config.is_live_port() and not config.ALLOW_LIVE:
         log.error("拒绝：--execute + 实盘端口，但 IB_ALLOW_LIVE=false。")
@@ -290,16 +332,9 @@ def stage_trade(args) -> int:
         log.info("对账结果：\n%s", report.text())
         acct.save_snapshot(ib)
 
-    # 归档：信号被消费掉了，pending 必须清空，否则明天会重复执行一遍陈旧信号
-    archive = config.SIGNAL_DIR / f"{signal_date}_{sig['strategy']}.json"
-    sig["executed_at"] = datetime.now(timezone.utc).isoformat()
-    sig["orders"] = result.to_dict("records") if not result.empty else []
-    sig["reconcile_ok"] = report.ok
-    sig["reconcile_problems"] = report.problems
-    archive.write_text(json.dumps(sig, indent=2, ensure_ascii=False, default=str),
-                       encoding="utf-8")
-    PENDING.unlink()
-    log.info("信号已归档到 %s，pending 已清空。", archive.name)
+    _archive(sig, signal_date,
+             orders=result.to_dict("records") if not result.empty else [],
+             reconcile_ok=report.ok, reconcile_problems=report.problems)
 
     n = len(result) if not result.empty else 0
     if report.ok:
@@ -329,6 +364,8 @@ def main() -> int:
     ap.add_argument("--min-trade", type=float, default=200.0)
     ap.add_argument("--settle-seconds", type=float, default=10.0,
                     help="下单后等多久再对账")
+    ap.add_argument("--ignore-calendar", action="store_true",
+                    help="无视策略声明的调仓日历，每天都调。会让实盘换手率显著偏离回测")
     args = ap.parse_args()
 
     if args.stage == "signal" and not args.strategy:
