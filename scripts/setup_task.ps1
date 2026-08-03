@@ -29,6 +29,8 @@ param(
     [string]$SignalTimeET = "17:10",       # 美东收盘 16:00，留足日线结算时间
     [string]$TradeTimeET  = "09:45",       # 美东开盘 09:30，避开开盘前 15 分钟的乱价
     [switch]$Execute,                      # 不加 = Trade 阶段只预演
+    [ValidateSet("LMT","MKT")]
+    [string]$OrderType    = "LMT",         # 延迟行情下 LMT 常挂不上，首次验证可用 MKT
     [string]$TaskPrefix   = "IBKR",
     [switch]$Remove
 )
@@ -82,7 +84,7 @@ $paramArg = ""
 if ($Params -ne "") { $paramArg = " --params $Params" }
 
 $signalArgs = "`"$job`" --stage signal --strategy `"$Strategy`"$paramArg"
-$tradeArgs  = "`"$job`" --stage trade"
+$tradeArgs  = "`"$job`" --stage trade --order-type $OrderType"
 if ($Execute) { $tradeArgs += " --execute" }
 
 # ---------------------------------------------------------------- 注册
@@ -115,7 +117,7 @@ Register-JobTask -Name $tradeName -Arguments $tradeArgs -At $tradeLocal `
 
 # ---------------------------------------------------------------- 汇总
 $mode = "预演（不下单）"
-if ($Execute) { $mode = "真实下单" }
+if ($Execute) { $mode = "真实下单 / $OrderType" }
 
 Write-Host ""
 Write-Host "已注册两个计划任务：" -ForegroundColor Green

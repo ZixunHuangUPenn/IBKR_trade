@@ -189,27 +189,65 @@ def execute_plan(
     if not what_if and getattr(ib, "readonly_mode", False):
         raise RuntimeError("当前是只读连接，拒绝下单。去 .env 把 IB_READONLY 设为 false。")
 
+    # 先把所有合约认全，再发第一笔单。
+    #
+    # 注意 qualifyContracts 的返回语义很容易看错：它返回的列表**长度永远等于入参个数**，
+    # 认不出来的位置放 None（见 ib_async 的 qualifyContractsAsync 文档）。
+    # 所以 `if not ib.qualifyContracts(c)` 判断的是 `not [None]` == False，永远不触发。
+    # 必须逐个查 None / conId。
+    #
+    # 为什么要一次性全查完再下单：认不出来的合约是个 conId=0 的空壳，拿它 placeOrder
+    # 行为未定义。而如果放在循环里逐个查，失败发生在中途 —— 前几笔已经成交，
+    # 组合停在一个谁也没想要的中间状态。要么全做，要么一笔都不做。
+    contracts = [make_contract(p.symbol) for p in plans]
+    qualified = ib.qualifyContracts(*contracts)
+    unknown = [p.symbol for p, c in zip(plans, qualified)
+               if c is None or not getattr(c, "conId", 0)]
+    if unknown:
+        raise ValueError(
+            f"这些代码 IBKR 认不出来: {unknown}\n"
+            f"常见原因：拼写错误，或者标的池里混进了 00_offline_demo.py 生成的 "
+            f"SYNTH_* 合成数据。一笔都不会发送。"
+        )
+
     results = []
-    for p in plans:
-        contract = make_contract(p.symbol)
-        ib.qualifyContracts(contract)
+    for p, contract in zip(plans, qualified):
         order = _build_order(p, order_type, limit_band_bps)
-        order.whatIf = what_if
         if config.ACCOUNT:
             order.account = config.ACCOUNT
 
-        trade = ib.placeOrder(contract, order)
-
         if what_if:
-            ib.sleep(2)
-            st = trade.orderStatus
+            # 保证金预演必须走 whatIfOrder。
+            # 不能用 placeOrder(whatIf=True) 再读 trade.orderStatus —— OrderStatus 上
+            # 根本没有 initMarginChange / commission，它们在 OrderState 上，
+            # 而 Trade 不携带 OrderState。读了就是 AttributeError。
+            #
+            # whatIfOrder 标注返回 OrderState，但只有当 IBKR 回的 orderState 里
+            # initMarginChange 有值时 ib_async 才会兑现那个 future；否则超时后
+            # 返回内部默认值 —— 一个空列表。所以返回类型实际上是不确定的。
+            st = ib.whatIfOrder(contract, order)
+            if isinstance(st, list):
+                st = st[0] if st else None
+
+            if st is None or not hasattr(st, "initMarginChange"):
+                # 这一步什么也没校验成。必须说清楚，否则"跑完了没报错"会被当成通过。
+                log.warning("  [whatIf] %s 没拿到保证金回执，这笔没有被校验。", p.symbol)
+                results.append({**p.__dict__, "status": "whatIf-无回执"})
+                continue
+
             log.info("  [whatIf] %s %s x%d -> 初始保证金 %s / 维持保证金 %s / 佣金 %s",
                      p.action, p.symbol, p.quantity,
                      st.initMarginChange, st.maintMarginChange, st.commission)
+            if st.warningText:
+                log.warning("  [whatIf] %s IBKR 警告: %s", p.symbol, st.warningText)
             results.append({**p.__dict__, "status": "whatIf",
                             "init_margin": st.initMarginChange,
-                            "commission": st.commission})
+                            "maint_margin": st.maintMarginChange,
+                            "commission": st.commission,
+                            "warning": st.warningText})
             continue
+
+        trade = ib.placeOrder(contract, order)
 
         # 等终态。不做 fire-and-forget —— 你必须知道到底成没成。
         waited = 0.0
@@ -225,16 +263,74 @@ def execute_plan(
             log.info("  %s %s -> %s 成交 %s 股 @ %s",
                      p.action, p.symbol, st.status, st.filled, st.avgFillPrice)
 
-        results.append({**p.__dict__, "status": st.status,
+        results.append({**p.__dict__, "order_id": trade.order.orderId,
+                        "status": st.status,
                         "filled": st.filled, "avg_fill_price": st.avgFillPrice})
 
-    return pd.DataFrame(results)
+    # 以 IBKR 为准复核一遍。本地状态会被"假取消"污染（见 cancel_all 的注释），
+    # 一笔活着的单可能刚被我们报成 Cancelled —— 报错了比没报更危险，
+    # 因为后面的对账会以为仓位已经落定。
+    if not what_if and results:
+        ib.sleep(1)
+        live = {t.order.orderId: t.orderStatus.status for t in ib.reqAllOpenOrders()}
+        for row in results:
+            oid = row.get("order_id")
+            if oid in live and row["status"] not in ("Filled",):
+                if row["status"] != live[oid]:
+                    log.warning("  %s 本地状态是 %s，但 IBKR 侧仍在挂单（%s）—— 以 IBKR 为准。",
+                                row["symbol"], row["status"], live[oid])
+                row["status"] = live[oid]
+                row["still_open"] = True
+
+    df = pd.DataFrame(results)
+
+    # 一笔都没拿到回执，说明 --what-if 这一步整个是空转。
+    # 不吭声的话，"跑完了没报错"会被当成"IBKR 校验通过了"，那比不做还危险。
+    if what_if and not df.empty and (df["status"] == "whatIf-无回执").all():
+        log.warning(
+            "所有 whatIf 请求都没拿到保证金回执 —— 这一步没有校验任何东西。\n"
+            "  IBKR 只有在返回的 orderState 里带保证金数据时才会兑现请求，"
+            "Paper Gateway 上经常不带。\n"
+            "  别把它当成一道通过了的关卡；真正拦得住错误的是 _preflight 的熔断和 DRY_RUN。"
+        )
+
+    return df
 
 
-def cancel_all(ib: IB) -> int:
-    """紧急止血：撤掉所有未成交订单。"""
-    trades = ib.openTrades()
-    for t in trades:
-        ib.cancelOrder(t.order)
-    log.warning("已发出撤单请求 %d 笔。", len(trades))
-    return len(trades)
+def cancel_all(ib: IB, attempts: int = 3, settle: float = 4.0) -> int:
+    """
+    紧急止血：撤掉所有未成交订单。撤不干净就抛错。
+
+    两个坑，都被踩过：
+
+    1) 必须用 reqAllOpenOrders()（问 IBKR）而不是 openTrades()（读本地缓存）。
+       ib_async 会因为某些纯提示性的券商消息把订单本地标成 Cancelled ——
+       比如 10349 "Order TIF was set to DAY based on order preset"，它不在
+       ib_async 的 warningCodes 白名单里，于是走进"这单出问题了，取消掉"的分支。
+       此时订单在 IBKR 那边还好好活着，却已经从 openTrades() 里消失了。
+
+    2) 必须循环到确认清空。刚发出去的单可能还没在券商侧登记完，
+       单次快照会漏掉它 —— 实测就漏过一笔。
+
+    撤漏一笔的后果不是"少撤了一笔"，是下一轮新单和它叠成超额仓位，
+    而这正是调用方要防的事。所以宁可抛错中断，也不能报告一个假的成功。
+    """
+    total = 0
+    for i in range(attempts):
+        trades = ib.reqAllOpenOrders()
+        if not trades:
+            break
+        for t in trades:
+            ib.cancelOrder(t.order)
+        total += len(trades)
+        log.warning("第 %d 轮：发出撤单请求 %d 笔", i + 1, len(trades))
+        ib.sleep(settle)
+
+    left = ib.reqAllOpenOrders()
+    if left:
+        raise RuntimeError(
+            f"撤了 {attempts} 轮，IBKR 侧仍有 {len(left)} 笔挂着："
+            f"{[(t.contract.symbol, t.orderStatus.status) for t in left]}\n"
+            f"去 TWS 里手动处理。继续下单会和它们叠成超额仓位。"
+        )
+    return total

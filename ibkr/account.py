@@ -106,10 +106,17 @@ def positions_df(ib: IB, account: str | None = None) -> pd.DataFrame:
 
 
 def open_orders_df(ib: IB) -> pd.DataFrame:
+    """
+    未成交订单。用 reqAllOpenOrders()（问 IBKR）而不是 openTrades()（读本地缓存）。
+
+    ib_async 会因为某些纯提示性的券商消息把订单本地标成 Cancelled（详见
+    execution.cancel_all 的注释），那笔单就从 openTrades() 里消失了，
+    可它在 IBKR 那边还活着。对账要是也瞎了，这道防线就等于不存在。
+    """
     cols = ["orderId", "symbol", "action", "orderType", "quantity",
             "lmtPrice", "status", "filled", "remaining"]
     rows = []
-    for t in ib.openTrades():
+    for t in ib.reqAllOpenOrders():
         rows.append({
             "orderId": t.order.orderId,
             "symbol": t.contract.symbol,

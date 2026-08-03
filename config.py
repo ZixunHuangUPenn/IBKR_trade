@@ -31,15 +31,28 @@ def _bool(key: str, default: bool = False) -> bool:
     return os.getenv(key, str(default)).strip().lower() in ("1", "true", "yes", "on")
 
 
+# .env 里把某一项留空（`IB_PORT=`）是很自然的写法，但 os.getenv 返回的是 ""
+# 而不是 None，默认值根本轮不上，int("") 直接崩在 import 期。
+# 崩在这里还算幸运 —— 更坏的情况是配置被误读成别的值，而你不知道。
+def _int(key: str, default: int) -> int:
+    v = os.getenv(key, "").strip()
+    return int(v) if v else default
+
+
+def _float(key: str, default: float) -> float:
+    v = os.getenv(key, "").strip()
+    return float(v) if v else default
+
+
 # ---------------- 连接 ----------------
-HOST = os.getenv("IB_HOST", "127.0.0.1")
-PORT = int(os.getenv("IB_PORT", "4002"))
-CLIENT_ID = int(os.getenv("IB_CLIENT_ID", "10"))
+HOST = os.getenv("IB_HOST", "").strip() or "127.0.0.1"
+PORT = _int("IB_PORT", 4002)
+CLIENT_ID = _int("IB_CLIENT_ID", 10)
 ALLOW_LIVE = _bool("IB_ALLOW_LIVE", False)
 READONLY = _bool("IB_READONLY", True)
 ACCOUNT = os.getenv("IB_ACCOUNT", "").strip() or None
 
-MARKET_DATA_TYPE = int(os.getenv("IB_MARKET_DATA_TYPE", "3"))
+MARKET_DATA_TYPE = _int("IB_MARKET_DATA_TYPE", 3)
 
 LIVE_PORTS = {4001, 7496}
 PAPER_PORTS = {4002, 7497}
@@ -63,17 +76,22 @@ def assert_safe_to_connect(port: int = None) -> None:
 
 
 # ---------------- 无人值守作业 ----------------
+# 定时作业必须用和交互式工具（dashboard / 手动脚本）不同的 clientId。
+# 同一个 clientId 连两次会互相踢掉 —— 你在作业跑的那一刻刷新一下 dashboard，
+# 当天的调仓就没了，而且是静默的。默认 +1 保证改了 IB_CLIENT_ID 也依然错开。
+JOB_CLIENT_ID = _int("IB_JOB_CLIENT_ID", CLIENT_ID + 1)
+
 # Gateway 每天会自动重启，重启期间 API 连不上。定时任务撞上这个窗口是常态，
 # 所以"连不上就退出"是不可接受的 —— 必须重试，且重试间隔要盖过重启耗时。
-CONNECT_RETRIES = int(os.getenv("IB_CONNECT_RETRIES", "5"))
-CONNECT_RETRY_DELAY = float(os.getenv("IB_CONNECT_RETRY_DELAY", "60"))
+CONNECT_RETRIES = _int("IB_CONNECT_RETRIES", 5)
+CONNECT_RETRY_DELAY = _float("IB_CONNECT_RETRY_DELAY", 60)
 
 # 信号最多能放多久还算数（日历日）。周末 + 一个假日 = 3 天，留到 4 天。
 # 超过说明信号作业已经挂了好几天了，这时候按陈旧信号下单比不下单危险得多。
-MAX_SIGNAL_AGE_DAYS = int(os.getenv("JOB_MAX_SIGNAL_AGE_DAYS", "4"))
+MAX_SIGNAL_AGE_DAYS = _int("JOB_MAX_SIGNAL_AGE_DAYS", 4)
 
 # 对账容忍度：单标的实际权重与目标权重的绝对偏差超过它就报警
-RECONCILE_TOLERANCE = float(os.getenv("JOB_RECONCILE_TOLERANCE", "0.02"))
+RECONCILE_TOLERANCE = _float("JOB_RECONCILE_TOLERANCE", 0.02)
 
 # 出问题时往哪发通知。留空 = 只写日志。
 # 任何接受 POST JSON 的 URL 都行（Bark / Slack / 企业微信 / 自建接口）。

@@ -98,7 +98,11 @@ def download_bars(
         MIDPOINT       买卖中价（外汇、以及没有成交量的品种用）
     """
     contract = make_contract(symbol)
-    if not ib.qualifyContracts(contract):
+    # qualifyContracts 返回的列表长度永远等于入参个数，认不出来的位置放 None，
+    # 所以 `if not ib.qualifyContracts(c)` 判断的是 `not [None]` == False，永远不触发。
+    # 得查 conId（成功时 qualifyContracts 会就地把它写回 contract）。
+    ib.qualifyContracts(contract)
+    if not contract.conId:
         raise RuntimeError(f"{symbol}: 合约无法识别。检查代码拼写，或指定 primaryExchange。")
 
     frames: list[pd.DataFrame] = []

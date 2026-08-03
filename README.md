@@ -145,7 +145,18 @@ rebalancer.py          你原有的再平衡脚本（保留）
 > 本项目在 `execution.py` 里自己补了一道客户端拦截，但**别只依赖它**——
 > 学习阶段请务必在 Gateway 里把那个框勾上，那才是券商侧的硬保护。
 
-下单前的三级演练：`DRY_RUN`（只打印）→ `--what-if`（IBKR 真实校验保证金但不成交）→ `--execute`。
+下单前的三级演练：`DRY_RUN`（只打印）→ `--what-if`（让 IBKR 校验保证金但不成交）→ `--execute`。
+
+> ⚠️ `--what-if` 靠不住，别把它当成一道通过了的关卡。
+> `ib_async` 只在 IBKR 返回的 `orderState` 带保证金数据时才兑现请求，而 Paper Gateway
+> 经常什么都不返回 —— 实测这个账户上恒定拿不到回执。代码已经改成显式报
+> `whatIf-无回执` 并告警，而不是假装通过。
+> 真正拦得住错误的是 `_preflight` 的熔断、`DRY_RUN`，以及 Gateway 侧的 Read-Only API 勾选框。
+
+另外 `execute_plan` 在发出第一笔单之前会把所有合约先认一遍，有任何一个 IBKR 认不出来
+就整体拒绝。`qualifyContracts` 的返回语义很容易看错：它返回的列表**长度永远等于入参个数**，
+认不出来的位置放 `None` —— 所以 `if not ib.qualifyContracts(c)` 是个永远不会触发的空判断，
+必须查 `conId`。
 
 ---
 
@@ -206,6 +217,21 @@ Get-ScheduledTaskInfo -TaskName IBKR-Signal | Select LastRunTime,LastTaskResult
 | 昨天的限价单没成交还挂着 | 下单前先 `cancel_all`，否则会和今天的新单叠成超额仓位 |
 | 下完单仓位没到位 | `ibkr/reconcile.py` 对账，偏差超容忍度就告警（**只告警，不自动补单**） |
 | 上次还没跑完又到点了 | 任务的 `MultipleInstances IgnoreNew` |
+| 今天不是策略的调仓日 | signal 阶段记录 `rebalance_day`，trade 阶段遵守（见下） |
+
+### 实盘必须遵守策略自己的调仓日历
+
+策略用 `rebalance_mask()` 声明什么时候可以调仓（横截面动量是月末）。回测严格遵守它，
+**实盘不遵守的话，跑的就不是被回测过的那个策略**。实测差距：
+
+```
+横截面动量，月末调仓        年换手  359%
+同一策略，日频 + 1% 带宽    年换手 2222%     ← 差 6.2 倍
+```
+
+收益上几乎看不出区别，成本上差一个数量级 —— 这种偏差最难被发现。
+所以 signal 阶段把 `rebalance_day` 写进信号，trade 阶段照办。
+想每天都调就加 `--ignore-calendar`，但那之后回测结果就不再代表实盘了。
 
 对账刻意不自动补单：自动补单的循环一旦写错（比如价格取错导致反复下单），损失不封顶。
 发现偏差先告警、让人看一眼，这个决定值得为它承受一点麻烦。
@@ -217,6 +243,48 @@ Get-ScheduledTaskInfo -TaskName IBKR-Signal | Select LastRunTime,LastTaskResult
 
 > 无人值守最危险的失败模式不是"崩了"，是"静悄悄地什么也没做"。
 > 任务计划器里那个 `LastTaskResult` 你不会每天去看。
+
+### 让 Gateway 自己起来（IBC）
+
+Gateway 是 GUI 程序，关掉了就没人再打开它 —— 这是"忘了开 Gateway 导致当天没跑"的根源。
+[IbcAlpha/IBC](https://github.com/IbcAlpha/IBC) 负责自动填账号密码、自动点掉那些
+会卡住登录的弹窗（"接受协议"、"版本过期"）。那些弹窗最阴险：进程活着、端口不监听，
+你的作业只看到"连不上"。
+
+本机已装在 `C:\IBC`，配置文件在 **`%USERPROFILE%\Documents\IBC\config.ini`** ——
+不是 `C:\IBC\config.ini`。IBC 刻意把配置和程序目录分开，这样重新解压升级 IBC
+不会覆盖掉带密码的配置。放错位置的表现是启动即 `ERRORLEVEL = 1006`。
+
+关键配置：
+
+```ini
+TradingMode=paper                       # 上实盘要改成 live
+OverrideTwsApiPort=4002                 # 实盘 Gateway 是 4001
+ReadOnlyApi=no                          # 显式允许下单，不依赖 GUI 里的勾选状态
+AutoRestartTime=03:00 AM
+ExistingSessionDetectedAction=primary   # 别被其他登录挤掉
+AcceptIncomingConnectionAction=accept   # 不弹 API 连接确认框
+IbLoginId= / IbPassword=                # 自己填
+```
+
+自启与自愈都走 `scripts/ibc_watchdog.ps1`：
+
+- 启动文件夹的 `IBC Gateway.lnk` —— 登录后立刻检查并拉起
+- 计划任务 `IBC-Gateway` —— 每 5 分钟检查一次
+
+**不能让计划任务直接跑 `StartGateway.bat`**：它内部用 `start` 派生独立窗口后立即返回，
+任务几秒就结束，`MultipleInstances=IgnoreNew` 那道防护完全落空 ——
+每次重复触发都找不到"正在运行的实例"可忽略，于是每次都再开一个 Gateway。
+后果不只是多几个进程，那是每 5 分钟一次的登录尝试。
+
+看门狗用 IBC 的 Java 进程（命令行含 `ibcalpha.ibc.IbcGateway`）判断是否在跑，
+而不是用 4002 端口：登录中（尤其等 2FA 时）端口还没起来但进程已经在了，
+用端口判断会在最不该重启的时候重启。
+
+实测：杀掉 Gateway 进程后，看门狗 18 秒内重新拉起并完成自动登录。
+
+> ⚠️ `config.ini` 里是**明文密码**。文件 ACL 已收窄到当前用户，但这台机器的安全
+> 就等于你的 IBKR 安全。上实盘前给 Gateway 单独建一个 IBKR username。
 
 ### 关于机器和登录
 
