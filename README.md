@@ -238,11 +238,26 @@ Get-ScheduledTaskInfo -TaskName IBKR-Signal | Select LastRunTime,LastTaskResult
 
 ### 通知
 
-`.env` 里设 `NOTIFY_WEBHOOK`（任何接受 POST JSON 的 URL，Bark / Slack / 企业微信都行）。
-不设就只写日志。
+`.env` 里设 `NOTIFY_WEBHOOK`，然后**跑一次自检确认它真的通**：
+
+```powershell
+python notify.py --test
+```
+
+发出去的 payload 同时带 `title`/`body` 和 `text`，所以 **Bark、Slack、Telegram
+都不用适配层**；Discord（要 `content`）、企业微信/飞书（要嵌套 `msgtype`）、
+ntfy（要 `topic`/`message`）则需要改 payload 形状。
 
 > 无人值守最危险的失败模式不是"崩了"，是"静悄悄地什么也没做"。
 > 任务计划器里那个 `LastTaskResult` 你不会每天去看。
+
+两条 `info` 级通知（"今日信号已生成"、"调仓完成"）是**心跳**。
+有效的监控不只是"出错时告警"，更是"该来的没来" —— 调仓日晚上没收到心跳，
+这件事本身就是最重要的信号，而只做错误告警的系统给不了你这个。
+
+`notify()` 返回的是**确认送达**，不是"发出去了"。HTTP 200 不等于送达：
+Bark 的 key 写错回 400，而企业微信、Telegram 这类是拿 200 + body 里的错误码
+表示失败的。只看状态码会漏掉后者 —— 一个你信任的坏通道，比压根没有通道更糟。
 
 ### 让 Gateway 自己起来（IBC）
 
