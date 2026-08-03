@@ -63,7 +63,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="按策略信号在 Paper 账户下单")
     ap.add_argument("--strategy", required=True, help=f"可选: {list(REGISTRY)}")
     ap.add_argument("--params", nargs="*", default=[])
-    ap.add_argument("--symbols", default="", help="留空 = 所有已缓存标的")
+    ap.add_argument("--symbols", default="", help="留空 = config.DEFAULT_UNIVERSE")
     ap.add_argument("--execute", action="store_true", help="真正发送订单")
     ap.add_argument("--what-if", action="store_true",
                     help="发给 IBKR 做保证金预演，不成交")
@@ -77,9 +77,14 @@ def main() -> int:
         return 1
 
     symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
-    symbols = symbols or cached_symbols()
-    if not symbols:
-        print("没有本地行情数据，先跑 scripts/02_download_data.py", file=sys.stderr)
+    # 默认用 DEFAULT_UNIVERSE，不是 cached_symbols()。
+    # 缓存里还躺着 00_offline_demo.py 写的 SYNTH_* 合成数据 —— 把它们喂给横截面动量，
+    # 排名会被合成序列占满，真 ETF 全被挤出去，而 SYNTH_* 根本不是可交易的合约。
+    symbols = symbols or list(config.DEFAULT_UNIVERSE)
+    missing_cache = [s for s in symbols if s not in cached_symbols()]
+    if missing_cache:
+        print(f"这些标的没有本地缓存: {missing_cache}\n"
+              f"先跑 scripts/02_download_data.py", file=sys.stderr)
         return 1
 
     prices = load_universe_prices(symbols)
@@ -98,7 +103,10 @@ def main() -> int:
         print("  （空仓）")
     print("=" * 72)
 
-    with IBConnection(readonly=config.READONLY and not args.execute) as ib:
+    # whatIf 单在线路上仍然要走 placeOrder（只是带了 whatIf 标记不成交），
+    # 所以 --what-if 也不能用只读连接，否则请求会被券商侧挡掉。
+    readonly = config.READONLY and not (args.execute or args.what_if)
+    with IBConnection(readonly=readonly) as ib:
         nav = acct.account_summary(ib)["NetLiquidation"]
         pos_df = acct.positions_df(ib)
         current = dict(zip(pos_df["symbol"], pos_df["position"])) if not pos_df.empty else {}

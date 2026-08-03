@@ -93,7 +93,8 @@ def stage_signal(args) -> int:
     symbols = symbols or config.DEFAULT_UNIVERSE
 
     # 只读连接：这一步只下数据，从连接层就断掉下单的可能
-    with IBConnection(readonly=True, retries=config.CONNECT_RETRIES) as ib:
+    with IBConnection(readonly=True, client_id=config.JOB_CLIENT_ID,
+                      retries=config.CONNECT_RETRIES) as ib:
         data = download_universe(ib, symbols, duration=args.duration,
                                  bar_size="1 day", what_to_show="ADJUSTED_LAST")
 
@@ -235,7 +236,8 @@ def stage_trade(args) -> int:
         return 1
 
     readonly = config.READONLY and not args.execute
-    with IBConnection(readonly=readonly, retries=config.CONNECT_RETRIES) as ib:
+    with IBConnection(readonly=readonly, client_id=config.JOB_CLIENT_ID,
+                      retries=config.CONNECT_RETRIES) as ib:
         if _market_closed_today(ib):
             # 美股假日。信号不消费，留到下一个交易日执行（年龄检查会兜住太久的情况）。
             log.info("今天美股休市。保留待执行信号，正常退出。")

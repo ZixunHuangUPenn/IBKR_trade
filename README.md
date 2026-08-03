@@ -145,7 +145,18 @@ rebalancer.py          你原有的再平衡脚本（保留）
 > 本项目在 `execution.py` 里自己补了一道客户端拦截，但**别只依赖它**——
 > 学习阶段请务必在 Gateway 里把那个框勾上，那才是券商侧的硬保护。
 
-下单前的三级演练：`DRY_RUN`（只打印）→ `--what-if`（IBKR 真实校验保证金但不成交）→ `--execute`。
+下单前的三级演练：`DRY_RUN`（只打印）→ `--what-if`（让 IBKR 校验保证金但不成交）→ `--execute`。
+
+> ⚠️ `--what-if` 靠不住，别把它当成一道通过了的关卡。
+> `ib_async` 只在 IBKR 返回的 `orderState` 带保证金数据时才兑现请求，而 Paper Gateway
+> 经常什么都不返回 —— 实测这个账户上恒定拿不到回执。代码已经改成显式报
+> `whatIf-无回执` 并告警，而不是假装通过。
+> 真正拦得住错误的是 `_preflight` 的熔断、`DRY_RUN`，以及 Gateway 侧的 Read-Only API 勾选框。
+
+另外 `execute_plan` 在发出第一笔单之前会把所有合约先认一遍，有任何一个 IBKR 认不出来
+就整体拒绝。`qualifyContracts` 的返回语义很容易看错：它返回的列表**长度永远等于入参个数**，
+认不出来的位置放 `None` —— 所以 `if not ib.qualifyContracts(c)` 是个永远不会触发的空判断，
+必须查 `conId`。
 
 ---
 
