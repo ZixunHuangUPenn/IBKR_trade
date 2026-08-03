@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+import time
 from typing import Callable, TypeVar
 
 from ib_async import IB
@@ -43,7 +44,9 @@ def _attach_error_logger(ib: IB) -> None:
         elif errorCode == 162:
             log.warning("历史数据被拒 (162): %s —— 通常是没有该品种的行情权限，"
                         "或请求过于频繁触发限速", errorString)
-        elif errorCode in (354, 10089, 10090):
+        elif errorCode in (354, 10089, 10090, 10167):
+            # 10167 是"没订阅，改用延迟行情" —— 在 IB_MARKET_DATA_TYPE=3 下这正是预期行为。
+            # 把预期行为记成 ERROR，会训练出"看到 ERROR 也没事"的习惯，那才是真危险。
             log.warning("行情权限不足 (%s): %s —— 试试把 IB_MARKET_DATA_TYPE 设为 3（延迟行情）",
                         errorCode, errorString)
         elif errorCode == 200:
@@ -62,6 +65,11 @@ class IBConnection:
             print(ib.accountSummary())
 
     退出时一定断开，异常也一样。
+
+    retries / retry_delay 是给无人值守作业用的。手动跑脚本时连不上你自己会看见，
+    定时任务连不上则是静默失败 —— 而"连不上"在生产里是常态而非异常：
+    Gateway 每天自动重启，重启那几分钟 API 端口是关的。
+    默认 retries=0（手动跑立刻失败，反馈快），作业脚本自己传 config.CONNECT_RETRIES。
     """
 
     def __init__(
@@ -71,18 +79,20 @@ class IBConnection:
         client_id: int = None,
         readonly: bool = None,
         timeout: float = 20.0,
+        retries: int = 0,
+        retry_delay: float = None,
     ):
         self.host = host or config.HOST
         self.port = port or config.PORT
         self.client_id = client_id if client_id is not None else config.CLIENT_ID
         self.readonly = config.READONLY if readonly is None else readonly
         self.timeout = timeout
+        self.retries = retries
+        self.retry_delay = (config.CONNECT_RETRY_DELAY if retry_delay is None
+                            else retry_delay)
         self.ib: IB | None = None
 
-    def __enter__(self) -> IB:
-        config.assert_safe_to_connect(self.port)
-        _ensure_event_loop()
-
+    def _connect_once(self) -> IB:
         ib = IB()
         _attach_error_logger(ib)
         try:
@@ -94,6 +104,11 @@ class IBConnection:
                 readonly=self.readonly,
             )
         except (ConnectionRefusedError, OSError, asyncio.TimeoutError) as e:
+            # 连接失败时 ib_async 可能已经建了半个连接，不清理会占着 clientId
+            try:
+                ib.disconnect()
+            except Exception:  # noqa: BLE001
+                pass
             raise RuntimeError(
                 f"连不上 {self.host}:{self.port} —— {e}\n"
                 f"检查清单：\n"
@@ -103,6 +118,23 @@ class IBConnection:
                 f"  4. 'Trusted IPs' 里有 127.0.0.1 吗？\n"
                 f"  5. clientId={self.client_id} 是否被别的程序占用了（换一个试试）？"
             ) from e
+        return ib
+
+    def __enter__(self) -> IB:
+        config.assert_safe_to_connect(self.port)   # 这道锁不参与重试，错了就是错了
+        _ensure_event_loop()
+
+        attempts = self.retries + 1
+        for i in range(1, attempts + 1):
+            try:
+                ib = self._connect_once()
+                break
+            except RuntimeError:
+                if i >= attempts:
+                    raise
+                log.warning("第 %d/%d 次连接失败，%.0f 秒后重试"
+                            "（Gateway 可能正在自动重启）", i, attempts, self.retry_delay)
+                time.sleep(self.retry_delay)
 
         # 没有行情订阅时，必须显式要延迟行情，否则 marketPrice() 返回 nan
         ib.reqMarketDataType(config.MARKET_DATA_TYPE)

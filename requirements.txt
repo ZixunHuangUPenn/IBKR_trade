@@ -17,3 +17,7 @@ plotly>=5.20
 
 # ---- misc ----
 python-dotenv>=1.0
+# zoneinfo needs an IANA database; Windows has none built in.
+tzdata>=2024.1
+# only used to POST webhook alerts from the daily job
+requests>=2.31

@@ -20,8 +20,10 @@ DATA_DIR = ROOT / "data"
 BARS_DIR = DATA_DIR / "bars"          # 历史K线 parquet 缓存
 SNAPSHOT_DIR = DATA_DIR / "snapshots"  # 账户快照，给 dashboard 读
 RESULTS_DIR = DATA_DIR / "results"     # 回测结果
+SIGNAL_DIR = DATA_DIR / "signals"      # 待执行信号 + 历史归档
+LOGS_DIR = DATA_DIR / "logs"           # 日常作业日志
 
-for _d in (BARS_DIR, SNAPSHOT_DIR, RESULTS_DIR):
+for _d in (BARS_DIR, SNAPSHOT_DIR, RESULTS_DIR, SIGNAL_DIR, LOGS_DIR):
     _d.mkdir(parents=True, exist_ok=True)
 
 
@@ -58,6 +60,24 @@ def assert_safe_to_connect(port: int = None) -> None:
     if p not in LIVE_PORTS and p not in PAPER_PORTS:
         # 不认识的端口不拦，但要吭声
         print(f"[config] 警告：端口 {p} 既不是已知的 Paper 也不是实盘端口。")
+
+
+# ---------------- 无人值守作业 ----------------
+# Gateway 每天会自动重启，重启期间 API 连不上。定时任务撞上这个窗口是常态，
+# 所以"连不上就退出"是不可接受的 —— 必须重试，且重试间隔要盖过重启耗时。
+CONNECT_RETRIES = int(os.getenv("IB_CONNECT_RETRIES", "5"))
+CONNECT_RETRY_DELAY = float(os.getenv("IB_CONNECT_RETRY_DELAY", "60"))
+
+# 信号最多能放多久还算数（日历日）。周末 + 一个假日 = 3 天，留到 4 天。
+# 超过说明信号作业已经挂了好几天了，这时候按陈旧信号下单比不下单危险得多。
+MAX_SIGNAL_AGE_DAYS = int(os.getenv("JOB_MAX_SIGNAL_AGE_DAYS", "4"))
+
+# 对账容忍度：单标的实际权重与目标权重的绝对偏差超过它就报警
+RECONCILE_TOLERANCE = float(os.getenv("JOB_RECONCILE_TOLERANCE", "0.02"))
+
+# 出问题时往哪发通知。留空 = 只写日志。
+# 任何接受 POST JSON 的 URL 都行（Bark / Slack / 企业微信 / 自建接口）。
+NOTIFY_WEBHOOK = os.getenv("NOTIFY_WEBHOOK", "").strip() or None
 
 
 # ---------------- 回测默认参数 ----------------

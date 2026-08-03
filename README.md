@@ -54,11 +54,13 @@ python scripts\04_paper_trade.py --strategy 横截面动量   # 生成订单（�
 
 ```
 config.py              全局配置 + 实盘保护（三道锁）
+notify.py              告警推送（webhook，可选）
 ibkr/
-  connection.py        连接管理、事件循环处理、错误码翻译
+  connection.py        连接管理、事件循环处理、错误码翻译、断线重试
   account.py           净值/持仓/成交/快照
   market_data.py       历史K线下载 + parquet 缓存 + 限速处理
   execution.py         目标权重 → 订单 → 执行（含 DRY_RUN / whatIf / 熔断）
+  reconcile.py         对账：实际持仓 vs 目标权重
 backtest/
   engine.py            向量化回测引擎（防未来函数、权重漂移、换手成本）
   metrics.py           夏普/回撤/卡玛/换手 等指标
@@ -68,6 +70,8 @@ strategies/
   momentum.py          横截面动量、逆波动率、固定权重
 dashboard/app.py       Streamlit 可视化平台（账户/行情/回测实验室/数据管理）
 scripts/00~04          按顺序的四课时脚本
+scripts/05_daily_job   无人值守日常作业（signal / trade 两段式）
+scripts/setup_task.ps1 把日常作业注册成 Windows 计划任务
 rebalancer.py          你原有的再平衡脚本（保留）
 ```
 
@@ -142,6 +146,88 @@ rebalancer.py          你原有的再平衡脚本（保留）
 > 学习阶段请务必在 Gateway 里把那个框勾上，那才是券商侧的硬保护。
 
 下单前的三级演练：`DRY_RUN`（只打印）→ `--what-if`（IBKR 真实校验保证金但不成交）→ `--execute`。
+
+---
+
+## 无人值守：常开机器 + Gateway 自动重启 + 定时任务
+
+手动跑脚本和挂成定时任务，中间隔着的不是"加个 cron"，是三件事。
+
+### 为什么拆成 signal / trade 两段
+
+回测引擎的约定是 `lag=1`：**t 日收盘算信号，t+1 日持有**（见 `backtest/engine.py`）。
+而 `04_paper_trade.py` 是"算完立刻下单"。手动跑时你自己掌握时点所以无所谓，
+挂成定时任务就必须把时序钉死 —— 否则实盘表现会比回测**好**，而且是靠一个
+你没意识到的时序偏移换来的，这种偏差最难发现，也最不可能持续。
+
+```
+signal 阶段（美东 17:10，收盘后）  更新数据 → 算目标权重 → 写 data/signals/pending.json
+trade  阶段（美东 09:45，次日开盘后）读信号 → 撤残单 → 下单 → 对账 → 归档
+```
+
+顺带一个好处：信号先落盘，你晚上可以先看一眼再让它第二天执行。
+
+### 搭起来
+
+```powershell
+# 1. 先验证管道（跑完整流程但不写信号，因此绝不会产生交易；周末也能验）
+python scripts\05_daily_job.py --stage signal --strategy 横截面动量 --dry-run
+
+# 2. 注册两个计划任务。时点填**美东时间**，脚本自动换算成本机时区。
+#    默认 trade 阶段只预演，不下单。
+.\scripts\setup_task.ps1 -Strategy 横截面动量
+
+# 3. 观察一两周，确认每天都按时跑、信号合理、预演出来的订单没有离谱的
+#    然后才加 -Execute
+.\scripts\setup_task.ps1 -Strategy 横截面动量 -Execute
+
+# 拆掉
+.\scripts\setup_task.ps1 -Remove
+```
+
+日志在 `data/logs/YYYY-MM-DD_{signal,trade}.log`。查任务状态：
+
+```powershell
+Get-ScheduledTaskInfo -TaskName IBKR-Signal | Select LastRunTime,LastTaskResult
+```
+
+`LastTaskResult` 为 0 才算正常。作业的退出码是有意义的：**0 = 正常（含"今天本来就不该做事"），1 = 出问题了**。
+
+### 它替你挡住了什么
+
+| 情况 | 处理 |
+|---|---|
+| Gateway 正在自动重启，端口是关的 | 连接重试 5 次 × 60 秒（`IB_CONNECT_RETRIES`）；任务计划器再重试 5 次 × 10 分钟 |
+| 机器当时关着 / 睡着 | 任务的 `StartWhenAvailable`，醒来后补跑 |
+| 周末触发（周五的信号还在 pending 里） | trade 阶段直接退出，**不消费信号**，留到周一 |
+| 美股假日 | 向 IBKR 查 `liquidHours` 判断休市，保留信号退出；signal 阶段则因日线不是今天而不产生信号 |
+| signal 作业挂了好几天 | trade 阶段检查信号年龄，超过 4 天拒绝执行并告警 |
+| signal 和 trade 同一天跑了 | 拒绝执行（那等于 lag=0，破坏回测时序） |
+| 昨天的限价单没成交还挂着 | 下单前先 `cancel_all`，否则会和今天的新单叠成超额仓位 |
+| 下完单仓位没到位 | `ibkr/reconcile.py` 对账，偏差超容忍度就告警（**只告警，不自动补单**） |
+| 上次还没跑完又到点了 | 任务的 `MultipleInstances IgnoreNew` |
+
+对账刻意不自动补单：自动补单的循环一旦写错（比如价格取错导致反复下单），损失不封顶。
+发现偏差先告警、让人看一眼，这个决定值得为它承受一点麻烦。
+
+### 通知
+
+`.env` 里设 `NOTIFY_WEBHOOK`（任何接受 POST JSON 的 URL，Bark / Slack / 企业微信都行）。
+不设就只写日志。
+
+> 无人值守最危险的失败模式不是"崩了"，是"静悄悄地什么也没做"。
+> 任务计划器里那个 `LastTaskResult` 你不会每天去看。
+
+### 关于机器和登录
+
+- 计划任务设为**仅在用户登录时运行**。IB Gateway 本来就是 GUI 程序，这台机器
+  无论如何都得保持登录状态，所以这不是额外限制。
+- Gateway 的 auto-restart 时间**不要**落在上面两个作业时点附近。
+- 本机时区若不随美国一起进出夏令时（比如机器在国内），每年三月和十一月
+  要重跑一次 `setup_task.ps1` 让它重新换算。
+- 同一个 IBKR username 不能两处登录。Gateway 挂着的时候你再用手机 App 登录会
+  互相踢掉，自动交易就断了。去官网 `Settings → Users & Access Rights`
+  加一个 username 专供 Gateway，日常自己用另一个。
 
 ---
 
