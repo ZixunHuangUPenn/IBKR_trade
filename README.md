@@ -251,7 +251,11 @@ Gateway 是 GUI 程序，关掉了就没人再打开它 —— 这是"忘了开 
 会卡住登录的弹窗（"接受协议"、"版本过期"）。那些弹窗最阴险：进程活着、端口不监听，
 你的作业只看到"连不上"。
 
-本机已装在 `C:\IBC`，关键配置：
+本机已装在 `C:\IBC`，配置文件在 **`%USERPROFILE%\Documents\IBC\config.ini`** ——
+不是 `C:\IBC\config.ini`。IBC 刻意把配置和程序目录分开，这样重新解压升级 IBC
+不会覆盖掉带密码的配置。放错位置的表现是启动即 `ERRORLEVEL = 1006`。
+
+关键配置：
 
 ```ini
 TradingMode=paper                       # 上实盘要改成 live
@@ -263,11 +267,21 @@ AcceptIncomingConnectionAction=accept   # 不弹 API 连接确认框
 IbLoginId= / IbPassword=                # 自己填
 ```
 
-自启与自愈由两件东西负责：
+自启与自愈都走 `scripts/ibc_watchdog.ps1`：
 
-- 启动文件夹的 `IBC Gateway.lnk` —— 登录后立刻拉起
-- 计划任务 `IBC-Gateway` —— 每 15 分钟检查一次，`MultipleInstances=IgnoreNew`
-  意味着还活着就跳过，崩了才会重新拉起
+- 启动文件夹的 `IBC Gateway.lnk` —— 登录后立刻检查并拉起
+- 计划任务 `IBC-Gateway` —— 每 5 分钟检查一次
+
+**不能让计划任务直接跑 `StartGateway.bat`**：它内部用 `start` 派生独立窗口后立即返回，
+任务几秒就结束，`MultipleInstances=IgnoreNew` 那道防护完全落空 ——
+每次重复触发都找不到"正在运行的实例"可忽略，于是每次都再开一个 Gateway。
+后果不只是多几个进程，那是每 5 分钟一次的登录尝试。
+
+看门狗用 IBC 的 Java 进程（命令行含 `ibcalpha.ibc.IbcGateway`）判断是否在跑，
+而不是用 4002 端口：登录中（尤其等 2FA 时）端口还没起来但进程已经在了，
+用端口判断会在最不该重启的时候重启。
+
+实测：杀掉 Gateway 进程后，看门狗 18 秒内重新拉起并完成自动登录。
 
 > ⚠️ `config.ini` 里是**明文密码**。文件 ACL 已收窄到当前用户，但这台机器的安全
 > 就等于你的 IBKR 安全。上实盘前给 Gateway 单独建一个 IBKR username。
