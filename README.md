@@ -68,9 +68,16 @@ strategies/
   base.py              策略基类：价格表 → 目标权重表
   sma_cross.py         双均线趋势
   momentum.py          横截面动量、逆波动率、固定权重
+agent/                 AI 自主选股（不可回测，走单独的约束体系）
+  screen.py            候选资格硬门槛：流动性/价格/历史长度/杠杆产品黑名单
+  datapack.py          事实计算：喂给 AI 的每个数字都由它算，AI 不许自己编
+  policy.py            提案校验 —— 唯一真正拦得住 AI 的东西
+prompts/agent_trader.md  给 AI 的投资授权书（工作流程 + 决策纪律）
 dashboard/app.py       Streamlit 可视化平台（账户/行情/回测实验室/数据管理）
 scripts/00~04          按顺序的四课时脚本
 scripts/05_daily_job   无人值守日常作业（signal / trade 两段式）
+scripts/06_agent_signal  AI 自主选股的 prepare / fetch / commit 三阶段
+scripts/run_agent.ps1  AI 每日编排：备料 → claude 决策 → 校验落信号
 scripts/setup_task.ps1 把日常作业注册成 Windows 计划任务
 rebalancer.py          你原有的再平衡脚本（保留）
 ```
@@ -311,6 +318,111 @@ IbLoginId= / IbPassword=                # 自己填
 - 同一个 IBKR username 不能两处登录。Gateway 挂着的时候你再用手机 App 登录会
   互相踢掉，自动交易就断了。去官网 `Settings → Users & Access Rights`
   加一个 username 专供 Gateway，日常自己用另一个。
+
+---
+
+## AI 自主选股（可选，风险自负）
+
+让 AI 每天收盘后自己选股、自己定仓位，第二天开盘执行。
+
+### 先说清楚代价
+
+这个项目的核心不变量是"回测和实盘用同一个函数"。**AI 决策打破了它**：
+每天的决定依赖当天的推理，无法重放、无法回测、没有任何证据表明它有正期望。
+你放弃的是"我知道这个策略长什么样"，换来的是灵活性。
+
+所以整套设计的重点全部在**约束**上，而不是决策上。**先在 Paper 上跑够三个月。**
+
+### 它长这样
+
+```
+prepare   Python 算事实：账户 + 持仓行情 + 市场环境 + 最近几天的决策
+   ↓                                          → data/agent/context.md
+claude    AI 读材料 → 提名候选拿数据 → 写提案  → data/agent/proposal.json
+   ↓
+commit    逐条校验硬约束，通过才落信号        → data/signals/pending.json
+   ↓
+次日开盘   05_daily_job.py --stage trade       ← 这一步完全没改
+```
+
+**AI 只能写提案，写不了订单。** 它没有可下单的 IBKR 连接（`IBKR_AGENT_SANDBOX`
+从连接层封死），唯一的产出是一个 JSON 文件。那个文件要变成订单，必须先过
+`agent/policy.py`，再过 05 的熔断、开市检查、残单清理、对账。
+
+AI 那一环坏掉（幻觉、算错、被自己说服、跑挂了）的最坏结果是**今天不交易**，
+也就是保持昨天的仓位 —— 那是唯一一个我们确定有人认可过的状态。
+
+### 搭起来
+
+```powershell
+# 1. 空跑一遍验证管道（不写信号，周末也能跑）
+.\scripts\run_agent.ps1 -DryRun -Model sonnet
+
+# 2. 注册计划任务。Signal 那一半换成 AI，Trade 那一半原封不动。
+.\scripts\setup_task.ps1 -Agent
+
+# 3. 观察，然后才 -Execute
+.\scripts\setup_task.ps1 -Agent -Execute
+
+# 急停：AI 链路立刻停摆，删掉文件即恢复
+"先停一下" | Out-File data\agent\HALT -Encoding utf8
+```
+
+`claude` 必须能在无人值守时通过认证 —— 跑一次 `claude setup-token` 生成长期
+token，别等到某天凌晨才发现它卡在登录界面。
+
+### 硬约束（.env 里改，立刻生效）
+
+写在 prompt 里的是建议，写在 `config.py` 里的才是法律。**违反任何一条 =
+整份提案作废、当天不交易**，不做"截断到上限后继续"——截断出来的组合是
+AI 从没考虑过的东西，风险收益结构已经变了，而那个变化没经过任何人的判断。
+
+| 约束 | 默认（激进档） | 挡的是什么 |
+|---|---|---|
+| `AGENT_MAX_WEIGHT` | 33% | 单票押太重 |
+| `AGENT_MAX_POSITIONS` | 6 | 分散不足 / 过度分散 |
+| `AGENT_MAX_GROSS` | 100% | 加杠杆 |
+| `AGENT_MAX_TURNOVER` | 50%/天 | 每天推倒重来。口径是 `Σ\|Δw\|÷2`，空仓建满整个组合刚好 50% |
+| 只做多 | 权重 ≥ 0 | 做空 |
+| `AGENT_MIN_DOLLAR_VOL` | $50M | **流动性陷阱**——冲击成本不体现在任何你会看的数字上 |
+| `AGENT_MIN_PRICE` / `AGENT_MIN_HISTORY` | $10 / 500根 | 低价股、数据不全算不出 200 日线 |
+| 杠杆/反向 ETF 黑名单 | 见 `agent/screen.py` | TQQQ 这类流动性极好、前面几道全拦不住的东西 |
+| `AGENT_MAX_DRAWDOWN` | 20% | 没有回测的策略唯一能有的止损：亏到这里自动写 HALT 停摆 |
+
+校验跑**两遍**：`commit` 时一遍（堵"AI 写了违规提案"），`trade` 时再一遍
+（堵"有东西绕过 commit 直接写了 pending.json"——AI 是能敲命令的）。
+校验要放在数据被**使用**的地方，不能只放在被产生的地方。
+
+### 怎么指导它
+
+授权书在 [`prompts/agent_trader.md`](prompts/agent_trader.md)，直接改那个文件就行。
+里面最要紧的不是操作流程，是决策纪律，其中三条最值钱：
+
+- **默认动作是"什么都不做"**。LLM 有强烈的"既然叫我决策我就得做点什么"的
+  冲动，而每次调仓都是确定的成本换不确定的收益。逻辑没变就不该动。
+- **每个买入都要预先写好退出条件**，而且要具体到能执行（"跌破 50 日线约 $215"
+  而不是"基本面恶化"）。没有退出条件的仓位会变成一个你不断为它找新理由的仓位。
+- **它能看见自己前几天的决策和理由**（`data/agent/journal.jsonl` → context 第四节）。
+  没有这个，AI 每天都是第一次见到这个组合，于是每天重新想一遍"现在最该买什么"，
+  结果是无意义的高换手。这是 LLM 做投资决策最典型的失败模式。
+
+还有一条是硬性的：**AI 只允许引用 `context.md` 里出现过的数字**。所有指标由
+`agent/datapack.py` 算好喂给它，它不许自己推导。LLM 算数会错，而且错得很自信,
+你没法从输出里分辨哪个数是算的、哪个是编的。
+
+默认**不联网**（`--tools` 白名单里根本没有 WebSearch/WebFetch）。它的训练数据
+有截止日期，而市场早就把那些消息消化完了 —— 基于过时新闻做判断比不判断更糟。
+
+### 每天去看什么
+
+```powershell
+Get-Content data\logs\*_agent_run.log -Tail 30      # 编排日志（含每天花了多少钱）
+Get-Content data\agent\journal.jsonl                # 决策流水：买了什么、为什么、被拒过几次
+Get-Content data\agent\context.md                   # 今天喂给它的全部材料
+```
+
+被拒绝的提案也会进 journal，下次 prepare 会把它喂回给 AI —— 让它看见自己错在哪，
+否则同一个错误它会一直犯。
 
 ---
 

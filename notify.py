@@ -9,6 +9,9 @@
 
 自检：
     python notify.py --test
+
+从别的语言（比如 PowerShell 编排脚本）发一条：
+    python notify.py --send "标题" "正文" --level error
 """
 
 from __future__ import annotations
@@ -20,6 +23,17 @@ import config
 log = logging.getLogger("notify")
 
 TIMEOUT = 10
+
+# 正文长度上限。超了就截断，而不是原样发出去。
+#
+# 这是踩出来的：AI 作业把五个持仓的完整买入理由拼成一条通知，约 4KB，
+# Bark 那侧的 nginx 直接回 413 Request Entity Too Large —— 通知彻底没送到。
+# 而这恰恰是你最需要收到的那一条。
+#
+# 截断比发不出去好得多：推送的作用是"让你知道发生了什么、要不要去看"，
+# 完整内容本来就在日志和 data/agent/journal.jsonl 里。
+MAX_BODY = 800
+MAX_TITLE = 120
 
 
 def _delivered(resp) -> bool:
@@ -68,6 +82,14 @@ def notify(title: str, body: str = "", level: str = "info") -> bool:
     if not config.NOTIFY_WEBHOOK:
         return False
 
+    # 日志已经完整记下来了，从这里开始才截断 —— 别让显示层的限制
+    # 影响到你事后复盘时能看到的东西。
+    if len(body) > MAX_BODY:
+        body = body[:MAX_BODY] + f"\n…（还有 {len(body) - MAX_BODY} 字，见日志）"
+    if len(title) > MAX_TITLE:
+        title = title[:MAX_TITLE] + "…"
+    text = f"{title}\n{body}".strip()
+
     try:
         import requests
         # title/body 给 Bark 这类；text 给 Slack、Telegram 这类。
@@ -90,7 +112,23 @@ def _mask(url: str) -> str:
 
 def main() -> int:
     """自检：确认告警通道真的通。配完 NOTIFY_WEBHOOK 就该跑一次。"""
+    import argparse
+
+    ap = argparse.ArgumentParser(description="告警通道")
+    ap.add_argument("--send", nargs=2, metavar=("标题", "正文"),
+                    help="直接发一条。给 PowerShell 编排脚本用")
+    ap.add_argument("--level", default="info", choices=["info", "warn", "error"])
+    ap.add_argument("--test", action="store_true", help="自检")
+    args = ap.parse_args()
+
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+
+    if args.send:
+        # 通知发不出去不该反过来让调用方失败 —— 它是观测手段，不是业务逻辑。
+        # 所以这里永远返回 0，成功与否只写日志。
+        notify(args.send[0], args.send[1], level=args.level)
+        return 0
+
     if not config.NOTIFY_WEBHOOK:
         print("NOTIFY_WEBHOOK 没配。去 .env 里填一个接受 POST JSON 的 URL。")
         return 1

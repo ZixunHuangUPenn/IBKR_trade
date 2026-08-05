@@ -258,6 +258,24 @@ def stage_trade(args) -> int:
         return 1
 
     target = sig["weights"]
+
+    # AI 产出的信号，在这里把权重边界再过一遍。
+    #
+    # 这不是冗余：06_agent_signal.py 的 commit 校验堵的是"agent 写了份违规提案"，
+    # 而这一层堵的是"有东西绕过 commit 直接写了 pending.json"——
+    # agent 是能敲命令的，它有能力直接写这个文件。
+    # 校验必须放在数据被**使用**的地方，而不只是被产生的地方。
+    if sig.get("source") == "agent":
+        from agent.policy import check_weights   # 局部 import：05 本身不依赖 agent 包
+        bad = check_weights(target)
+        if bad:
+            msg = ("pending.json 声称来自 AI 作业，但权重违反硬约束：\n"
+                   + "\n".join(f"  - {v}" for v in bad)
+                   + "\n这份信号没有经过 commit 阶段的校验。拒绝执行。")
+            log.error(msg)
+            notify("拒绝交易：AI 信号未通过校验", msg, level="error")
+            return 1
+
     log.info("待执行信号：%s | 信号日 %s（%d 天前）| 目标 %s",
              sig["label"], signal_date, age,
              {k: f"{v:.2%}" for k, v in target.items()} or "（空仓）")
