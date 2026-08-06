@@ -124,6 +124,16 @@ class IBConnection:
 
     def __enter__(self) -> IB:
         config.assert_safe_to_connect(self.port)   # 这道锁不参与重试，错了就是错了
+
+        # agent 运行期间的封条。和上面那道锁一样不参与重试，也不接受参数覆盖 ——
+        # 它防的不是手滑，是一个能自己敲命令的 agent 决定去跑执行环节。
+        if config.AGENT_SANDBOX and not self.readonly:
+            raise RuntimeError(
+                "IBKR_AGENT_SANDBOX=1 期间只允许只读连接。\n"
+                "这是 agent 决策阶段的封条：决策和执行必须分开，"
+                "执行由次日开盘后的独立作业负责。"
+            )
+
         _ensure_event_loop()
 
         attempts = self.retries + 1

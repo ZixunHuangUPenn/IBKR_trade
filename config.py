@@ -22,8 +22,9 @@ SNAPSHOT_DIR = DATA_DIR / "snapshots"  # 账户快照，给 dashboard 读
 RESULTS_DIR = DATA_DIR / "results"     # 回测结果
 SIGNAL_DIR = DATA_DIR / "signals"      # 待执行信号 + 历史归档
 LOGS_DIR = DATA_DIR / "logs"           # 日常作业日志
+AGENT_DIR = DATA_DIR / "agent"         # AI 自主选股作业的工作区
 
-for _d in (BARS_DIR, SNAPSHOT_DIR, RESULTS_DIR, SIGNAL_DIR, LOGS_DIR):
+for _d in (BARS_DIR, SNAPSHOT_DIR, RESULTS_DIR, SIGNAL_DIR, LOGS_DIR, AGENT_DIR):
     _d.mkdir(parents=True, exist_ok=True)
 
 
@@ -96,6 +97,58 @@ RECONCILE_TOLERANCE = _float("JOB_RECONCILE_TOLERANCE", 0.02)
 # 出问题时往哪发通知。留空 = 只写日志。
 # 任何接受 POST JSON 的 URL 都行（Bark / Slack / 企业微信 / 自建接口）。
 NOTIFY_WEBHOOK = os.getenv("NOTIFY_WEBHOOK", "").strip() or None
+
+
+# ---------------- AI 自主选股作业（scripts/06_agent_signal.py）----------------
+# 这一段和上面所有配置有一个本质区别：这里的每一条都是**硬上限**，不是给
+# agent 的建议。prompt 里写的话 agent 可以不听，写在这里的它绕不过去。
+#
+# 违反任何一条的处理方式是"整份提案作废，当天不交易"，而不是"截断到上限后继续"。
+# 截断出来的组合是 agent 从没考虑过的东西 —— 它可能本来打算 40% AAPL 配 60% 现金，
+# 截断成 33% 之后变成 33% AAPL + 67% 现金，风险收益完全不是一回事。
+# 不交易 = 保持昨天的仓位，这是唯一一个我们确定 agent 曾经认可过的状态。
+AGENT_STRATEGY_NAME = "AI自主选股"
+
+AGENT_MAX_WEIGHT = _float("AGENT_MAX_WEIGHT", 0.33)        # 单标的权重上限
+AGENT_MAX_POSITIONS = _int("AGENT_MAX_POSITIONS", 6)       # 最多同时持有几只
+AGENT_MAX_GROSS = _float("AGENT_MAX_GROSS", 1.00)          # 总仓位上限（1.0 = 不加杠杆）
+# 单边换手上限 = Σ|Δw| / 2。0.5 的含义："一天最多动净值的一半"。
+# 为什么用单边口径：空仓建满一个组合 Σ|Δw|=1.0，单边 0.5，刚好卡在上限内 ——
+# 建仓日不会被误杀；而把 6 只全换成另外 6 只是单边 1.0，会被拦下。
+# 换句话说，这条规则允许 agent 调整组合，但不允许它每天推倒重来。
+AGENT_MAX_TURNOVER = _float("AGENT_MAX_TURNOVER", 0.50)
+
+# 每天最多让 agent 拉多少个标的的数据。既是成本控制，也是 IBKR 限速保护
+# （历史数据 10 分钟约 60 次，见 ibkr/market_data.py）。
+AGENT_MAX_CANDIDATES = _int("AGENT_MAX_CANDIDATES", 30)
+
+# 候选资格的硬门槛。agent 可以自由提名任何美股代码，但过不了这几关就不进候选池。
+# 这几条挡的是"流动性陷阱"：agent 挑了个日成交额 200 万的小票，
+# 你按净值 30% 去买，冲击成本能吃掉几个点，而回测里永远看不到这件事。
+AGENT_MIN_PRICE = _float("AGENT_MIN_PRICE", 10.0)
+AGENT_MIN_DOLLAR_VOL = _float("AGENT_MIN_DOLLAR_VOL", 50_000_000)  # 60日中位成交额
+AGENT_MIN_HISTORY = _int("AGENT_MIN_HISTORY", 500)                 # 至少多少根日线
+
+# 净值从历史高点回撤超过它就停止交易并告警。
+# 这是没有回测的策略唯一能有的"止损" —— 你不知道它什么时候会失效，
+# 只能规定亏到什么程度就必须停下来人工看一眼。
+AGENT_MAX_DRAWDOWN = _float("AGENT_MAX_DRAWDOWN", 0.20)
+
+# 额外拉黑的代码，逗号分隔。杠杆/反向 ETF 的内置名单见 agent/screen.py。
+AGENT_DENY = [s.strip().upper() for s in os.getenv("AGENT_DENY", "").split(",") if s.strip()]
+
+# 喂给 agent 的历史决策条数。它需要看见自己昨天为什么买，否则每天从零开始，
+# 结果就是无意义的高换手 —— 这是 LLM 做投资决策最典型的失败模式。
+AGENT_JOURNAL_DAYS = _int("AGENT_JOURNAL_DAYS", 5)
+
+# agent 运行期间的进程级封条，由 run_agent.ps1 在调用 claude 之前设上。
+# 设上之后，那一格里派生出来的任何 Python 进程都建不成"可下单"的连接
+# （强制点在 ibkr/connection.py）。
+#
+# 为什么不直接用 IB_READONLY：那个开关会被 05_daily_job.py 的 --execute 覆盖掉
+# （readonly = config.READONLY and not args.execute），所以它拦不住一个决定
+# 自己去跑 trade 阶段的 agent。这个封条不接受任何参数覆盖。
+AGENT_SANDBOX = _bool("IBKR_AGENT_SANDBOX", False)
 
 
 # ---------------- 回测默认参数 ----------------

@@ -68,9 +68,16 @@ strategies/
   base.py              策略基类：价格表 → 目标权重表
   sma_cross.py         双均线趋势
   momentum.py          横截面动量、逆波动率、固定权重
+agent/                 AI 自主选股（不可回测，走单独的约束体系）
+  screen.py            候选资格硬门槛：流动性/价格/历史长度/杠杆产品黑名单
+  datapack.py          事实计算：喂给 AI 的每个数字都由它算，AI 不许自己编
+  policy.py            提案校验 —— 唯一真正拦得住 AI 的东西
+prompts/agent_trader.md  给 AI 的投资授权书（工作流程 + 决策纪律）
 dashboard/app.py       Streamlit 可视化平台（账户/行情/回测实验室/数据管理）
 scripts/00~04          按顺序的四课时脚本
 scripts/05_daily_job   无人值守日常作业（signal / trade 两段式）
+scripts/06_agent_signal  AI 自主选股的 prepare / fetch / commit 三阶段
+scripts/run_agent.ps1  AI 每日编排：备料 → claude 决策 → 校验落信号
 scripts/setup_task.ps1 把日常作业注册成 Windows 计划任务
 rebalancer.py          你原有的再平衡脚本（保留）
 ```
@@ -238,11 +245,26 @@ Get-ScheduledTaskInfo -TaskName IBKR-Signal | Select LastRunTime,LastTaskResult
 
 ### 通知
 
-`.env` 里设 `NOTIFY_WEBHOOK`（任何接受 POST JSON 的 URL，Bark / Slack / 企业微信都行）。
-不设就只写日志。
+`.env` 里设 `NOTIFY_WEBHOOK`，然后**跑一次自检确认它真的通**：
+
+```powershell
+python notify.py --test
+```
+
+发出去的 payload 同时带 `title`/`body` 和 `text`，所以 **Bark、Slack、Telegram
+都不用适配层**；Discord（要 `content`）、企业微信/飞书（要嵌套 `msgtype`）、
+ntfy（要 `topic`/`message`）则需要改 payload 形状。
 
 > 无人值守最危险的失败模式不是"崩了"，是"静悄悄地什么也没做"。
 > 任务计划器里那个 `LastTaskResult` 你不会每天去看。
+
+两条 `info` 级通知（"今日信号已生成"、"调仓完成"）是**心跳**。
+有效的监控不只是"出错时告警"，更是"该来的没来" —— 调仓日晚上没收到心跳，
+这件事本身就是最重要的信号，而只做错误告警的系统给不了你这个。
+
+`notify()` 返回的是**确认送达**，不是"发出去了"。HTTP 200 不等于送达：
+Bark 的 key 写错回 400，而企业微信、Telegram 这类是拿 200 + body 里的错误码
+表示失败的。只看状态码会漏掉后者 —— 一个你信任的坏通道，比压根没有通道更糟。
 
 ### 让 Gateway 自己起来（IBC）
 
@@ -270,18 +292,58 @@ IbLoginId= / IbPassword=                # 自己填
 自启与自愈都走 `scripts/ibc_watchdog.ps1`：
 
 - 启动文件夹的 `IBC Gateway.lnk` —— 登录后立刻检查并拉起
-- 计划任务 `IBC-Gateway` —— 每 5 分钟检查一次
+- 计划任务 `IBC-Gateway` —— **每天只跑两次**，各在 Signal / Trade 作业前一小时
+
+不是每 N 分钟轮询一次，是**只在需要 Gateway 之前才检查**。理由很简单：
+除了那两个时点，Gateway 在不在跑都没人关心；轮询买来的那点"更早发现"，
+换的是一天几百次唤醒。留一小时提前量是因为拉起 + 自动登录实测 18 秒就够，
+一小时足够容纳一次失败后你自己介入。
 
 **不能让计划任务直接跑 `StartGateway.bat`**：它内部用 `start` 派生独立窗口后立即返回，
 任务几秒就结束，`MultipleInstances=IgnoreNew` 那道防护完全落空 ——
-每次重复触发都找不到"正在运行的实例"可忽略，于是每次都再开一个 Gateway。
-后果不只是多几个进程，那是每 5 分钟一次的登录尝试。
+每次触发都找不到"正在运行的实例"可忽略，于是每次都再开一个 Gateway。
+后果不只是多几个进程，那是一次又一次的重复登录尝试。
 
 看门狗用 IBC 的 Java 进程（命令行含 `ibcalpha.ibc.IbcGateway`）判断是否在跑，
 而不是用 4002 端口：登录中（尤其等 2FA 时）端口还没起来但进程已经在了，
 用端口判断会在最不该重启的时候重启。
 
-实测：杀掉 Gateway 进程后，看门狗 18 秒内重新拉起并完成自动登录。
+实测：看门狗一旦触发，杀掉的 Gateway 进程 18 秒内就能重新拉起并完成自动登录。
+
+**失败会自动重试，每 5 分钟一次，最多 11 次**（任务的 `RestartInterval`），
+正好覆盖到作业开跑前的那一小时。所以"只跑两次"不等于"只有两次机会" ——
+不失败就真的只跑两次，失败了才会开始每 5 分钟敲一次门。
+
+要让重试真正起作用，脚本必须**如实报告失败**，这是它退出码的全部意义：
+
+| 情况 | 退出码 | 后果 |
+|---|---|---|
+| Gateway 已在跑 | 0 | 什么都不做 |
+| 拉起后 90 秒内确认进程起来了 | 0 | 完成 |
+| 拉起后 90 秒内没看到进程 | 1 | 5 分钟后重试 |
+| 进程不在但 4002 被别的东西占着 | 1 | 5 分钟后重试（多半要人工处理）|
+
+那个 90 秒的确认不能省。`StartGateway.bat` 无论成功失败都会正常返回，
+配置放错位置（`ERRORLEVEL 1006`）、IBC 和 Gateway 版本对不上、磁盘满，
+表现都是一样的。看门狗要是发完命令就报成功，重试就永远不会触发。
+
+偶尔扫一眼有没有在反复重试：
+
+```powershell
+Get-ScheduledTaskInfo -TaskName IBC-Gateway | Select LastRunTime,LastTaskResult
+```
+
+时点是从 `IBKR-Signal` / `IBKR-Trade` 的实际触发时间各减一小时算出来的。
+**重跑 `setup_task.ps1` 改了作业时点（含每年两次的夏令时换算）之后，
+这两个触发器不会自动跟着走**，得重新设一遍：
+
+```powershell
+$sig = ([datetime](Get-ScheduledTask -TaskName IBKR-Signal).Triggers[0].StartBoundary).AddHours(-1)
+$trd = ([datetime](Get-ScheduledTask -TaskName IBKR-Trade ).Triggers[0].StartBoundary).AddHours(-1)
+Set-ScheduledTask -TaskName IBC-Gateway -Trigger @(
+    (New-ScheduledTaskTrigger -Daily -At $sig),
+    (New-ScheduledTaskTrigger -Daily -At $trd))
+```
 
 > ⚠️ `config.ini` 里是**明文密码**。文件 ACL 已收窄到当前用户，但这台机器的安全
 > 就等于你的 IBKR 安全。上实盘前给 Gateway 单独建一个 IBKR username。
@@ -296,6 +358,111 @@ IbLoginId= / IbPassword=                # 自己填
 - 同一个 IBKR username 不能两处登录。Gateway 挂着的时候你再用手机 App 登录会
   互相踢掉，自动交易就断了。去官网 `Settings → Users & Access Rights`
   加一个 username 专供 Gateway，日常自己用另一个。
+
+---
+
+## AI 自主选股（可选，风险自负）
+
+让 AI 每天收盘后自己选股、自己定仓位，第二天开盘执行。
+
+### 先说清楚代价
+
+这个项目的核心不变量是"回测和实盘用同一个函数"。**AI 决策打破了它**：
+每天的决定依赖当天的推理，无法重放、无法回测、没有任何证据表明它有正期望。
+你放弃的是"我知道这个策略长什么样"，换来的是灵活性。
+
+所以整套设计的重点全部在**约束**上，而不是决策上。**先在 Paper 上跑够三个月。**
+
+### 它长这样
+
+```
+prepare   Python 算事实：账户 + 持仓行情 + 市场环境 + 最近几天的决策
+   ↓                                          → data/agent/context.md
+claude    AI 读材料 → 提名候选拿数据 → 写提案  → data/agent/proposal.json
+   ↓
+commit    逐条校验硬约束，通过才落信号        → data/signals/pending.json
+   ↓
+次日开盘   05_daily_job.py --stage trade       ← 这一步完全没改
+```
+
+**AI 只能写提案，写不了订单。** 它没有可下单的 IBKR 连接（`IBKR_AGENT_SANDBOX`
+从连接层封死），唯一的产出是一个 JSON 文件。那个文件要变成订单，必须先过
+`agent/policy.py`，再过 05 的熔断、开市检查、残单清理、对账。
+
+AI 那一环坏掉（幻觉、算错、被自己说服、跑挂了）的最坏结果是**今天不交易**，
+也就是保持昨天的仓位 —— 那是唯一一个我们确定有人认可过的状态。
+
+### 搭起来
+
+```powershell
+# 1. 空跑一遍验证管道（不写信号，周末也能跑）
+.\scripts\run_agent.ps1 -DryRun -Model sonnet
+
+# 2. 注册计划任务。Signal 那一半换成 AI，Trade 那一半原封不动。
+.\scripts\setup_task.ps1 -Agent
+
+# 3. 观察，然后才 -Execute
+.\scripts\setup_task.ps1 -Agent -Execute
+
+# 急停：AI 链路立刻停摆，删掉文件即恢复
+"先停一下" | Out-File data\agent\HALT -Encoding utf8
+```
+
+`claude` 必须能在无人值守时通过认证 —— 跑一次 `claude setup-token` 生成长期
+token，别等到某天凌晨才发现它卡在登录界面。
+
+### 硬约束（.env 里改，立刻生效）
+
+写在 prompt 里的是建议，写在 `config.py` 里的才是法律。**违反任何一条 =
+整份提案作废、当天不交易**，不做"截断到上限后继续"——截断出来的组合是
+AI 从没考虑过的东西，风险收益结构已经变了，而那个变化没经过任何人的判断。
+
+| 约束 | 默认（激进档） | 挡的是什么 |
+|---|---|---|
+| `AGENT_MAX_WEIGHT` | 33% | 单票押太重 |
+| `AGENT_MAX_POSITIONS` | 6 | 分散不足 / 过度分散 |
+| `AGENT_MAX_GROSS` | 100% | 加杠杆 |
+| `AGENT_MAX_TURNOVER` | 50%/天 | 每天推倒重来。口径是 `Σ\|Δw\|÷2`，空仓建满整个组合刚好 50% |
+| 只做多 | 权重 ≥ 0 | 做空 |
+| `AGENT_MIN_DOLLAR_VOL` | $50M | **流动性陷阱**——冲击成本不体现在任何你会看的数字上 |
+| `AGENT_MIN_PRICE` / `AGENT_MIN_HISTORY` | $10 / 500根 | 低价股、数据不全算不出 200 日线 |
+| 杠杆/反向 ETF 黑名单 | 见 `agent/screen.py` | TQQQ 这类流动性极好、前面几道全拦不住的东西 |
+| `AGENT_MAX_DRAWDOWN` | 20% | 没有回测的策略唯一能有的止损：亏到这里自动写 HALT 停摆 |
+
+校验跑**两遍**：`commit` 时一遍（堵"AI 写了违规提案"），`trade` 时再一遍
+（堵"有东西绕过 commit 直接写了 pending.json"——AI 是能敲命令的）。
+校验要放在数据被**使用**的地方，不能只放在被产生的地方。
+
+### 怎么指导它
+
+授权书在 [`prompts/agent_trader.md`](prompts/agent_trader.md)，直接改那个文件就行。
+里面最要紧的不是操作流程，是决策纪律，其中三条最值钱：
+
+- **默认动作是"什么都不做"**。LLM 有强烈的"既然叫我决策我就得做点什么"的
+  冲动，而每次调仓都是确定的成本换不确定的收益。逻辑没变就不该动。
+- **每个买入都要预先写好退出条件**，而且要具体到能执行（"跌破 50 日线约 $215"
+  而不是"基本面恶化"）。没有退出条件的仓位会变成一个你不断为它找新理由的仓位。
+- **它能看见自己前几天的决策和理由**（`data/agent/journal.jsonl` → context 第四节）。
+  没有这个，AI 每天都是第一次见到这个组合，于是每天重新想一遍"现在最该买什么"，
+  结果是无意义的高换手。这是 LLM 做投资决策最典型的失败模式。
+
+还有一条是硬性的：**AI 只允许引用 `context.md` 里出现过的数字**。所有指标由
+`agent/datapack.py` 算好喂给它，它不许自己推导。LLM 算数会错，而且错得很自信,
+你没法从输出里分辨哪个数是算的、哪个是编的。
+
+默认**不联网**（`--tools` 白名单里根本没有 WebSearch/WebFetch）。它的训练数据
+有截止日期，而市场早就把那些消息消化完了 —— 基于过时新闻做判断比不判断更糟。
+
+### 每天去看什么
+
+```powershell
+Get-Content data\logs\*_agent_run.log -Tail 30      # 编排日志（含每天花了多少钱）
+Get-Content data\agent\journal.jsonl                # 决策流水：买了什么、为什么、被拒过几次
+Get-Content data\agent\context.md                   # 今天喂给它的全部材料
+```
+
+被拒绝的提案也会进 journal，下次 prepare 会把它喂回给 AI —— 让它看见自己错在哪，
+否则同一个错误它会一直犯。
 
 ---
 
