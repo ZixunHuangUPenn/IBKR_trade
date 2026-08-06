@@ -292,18 +292,45 @@ IbLoginId= / IbPassword=                # 自己填
 自启与自愈都走 `scripts/ibc_watchdog.ps1`：
 
 - 启动文件夹的 `IBC Gateway.lnk` —— 登录后立刻检查并拉起
-- 计划任务 `IBC-Gateway` —— 每 5 分钟检查一次
+- 计划任务 `IBC-Gateway` —— **每天只跑两次**，各在 Signal / Trade 作业前一小时
+
+不是每 N 分钟轮询一次，是**只在需要 Gateway 之前才检查**。理由很简单：
+除了那两个时点，Gateway 在不在跑都没人关心；轮询买来的那点"更早发现"，
+换的是一天几百次唤醒。留一小时提前量是因为拉起 + 自动登录实测 18 秒就够，
+一小时足够容纳一次失败后你自己介入。
 
 **不能让计划任务直接跑 `StartGateway.bat`**：它内部用 `start` 派生独立窗口后立即返回，
 任务几秒就结束，`MultipleInstances=IgnoreNew` 那道防护完全落空 ——
-每次重复触发都找不到"正在运行的实例"可忽略，于是每次都再开一个 Gateway。
-后果不只是多几个进程，那是每 5 分钟一次的登录尝试。
+每次触发都找不到"正在运行的实例"可忽略，于是每次都再开一个 Gateway。
+后果不只是多几个进程，那是一次又一次的重复登录尝试。
 
 看门狗用 IBC 的 Java 进程（命令行含 `ibcalpha.ibc.IbcGateway`）判断是否在跑，
 而不是用 4002 端口：登录中（尤其等 2FA 时）端口还没起来但进程已经在了，
 用端口判断会在最不该重启的时候重启。
 
-实测：杀掉 Gateway 进程后，看门狗 18 秒内重新拉起并完成自动登录。
+实测：看门狗一旦触发，杀掉的 Gateway 进程 18 秒内就能重新拉起并完成自动登录。
+
+代价说清楚：两次触发之间没有任何人在看。Gateway 上午崩了，要等到 13:10
+那次才会被发现和拉起 —— 这是刻意的取舍，因为那期间没有作业要跑。真正的风险
+是**触发那次没成功**（比如 4002 被别的东西占着，看门狗会拒绝启动并退出码 1），
+这时候一小时内没有第二次尝试，作业时点就会撞上一个死的 Gateway。
+所以 `LastTaskResult` 值得偶尔看一眼：
+
+```powershell
+Get-ScheduledTaskInfo -TaskName IBC-Gateway | Select LastRunTime,LastTaskResult
+```
+
+时点是从 `IBKR-Signal` / `IBKR-Trade` 的实际触发时间各减一小时算出来的。
+**重跑 `setup_task.ps1` 改了作业时点（含每年两次的夏令时换算）之后，
+这两个触发器不会自动跟着走**，得重新设一遍：
+
+```powershell
+$sig = ([datetime](Get-ScheduledTask -TaskName IBKR-Signal).Triggers[0].StartBoundary).AddHours(-1)
+$trd = ([datetime](Get-ScheduledTask -TaskName IBKR-Trade ).Triggers[0].StartBoundary).AddHours(-1)
+Set-ScheduledTask -TaskName IBC-Gateway -Trigger @(
+    (New-ScheduledTaskTrigger -Daily -At $sig),
+    (New-ScheduledTaskTrigger -Daily -At $trd))
+```
 
 > ⚠️ `config.ini` 里是**明文密码**。文件 ACL 已收窄到当前用户，但这台机器的安全
 > 就等于你的 IBKR 安全。上实盘前给 Gateway 单独建一个 IBKR username。
