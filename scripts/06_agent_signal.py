@@ -39,6 +39,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import config
 from agent import datapack, policy, screen
+from dashboard import labels          # 只用它的查表功能，不会拖进 streamlit
 from ibkr import account as acct
 from ibkr.connection import IBConnection
 from ibkr.market_data import download_bars, load_bars
@@ -418,6 +419,21 @@ def stage_commit(args) -> int:
 
     weights = {str(k).upper(): round(float(v), 6)
                for k, v in proposal["target_weights"].items() if float(v) > 1e-9}
+
+    # 登记中文名。agent 能提名任意美股代码，手写的对照表不可能跟得上 ——
+    # 让它自己在选中的时候顺手把名字留下，dashboard 才不会显示一排光秃秃的代码。
+    #
+    # 放在校验通过之后：被拒的提案不该往对照表里留东西，那些代码明天可能根本
+    # 不会再出现。反过来，名字缺失**绝不能**影响交易 —— register_many 不抛异常，
+    # 这里也只是记一笔。一个显示问题没有资格让已经过了全部硬约束的调仓作废。
+    added, _ = labels.register_many(proposal.get("names", {}))
+    if added:
+        log.info("已登记中文名：%s",
+                 {s: labels.name(s) for s in added})
+    unnamed = [s for s in weights if not labels.info(s)]
+    if unnamed:
+        log.warning("以下标的没有中文名，dashboard 上只会显示代码：%s"
+                    "（agent 应该在 proposal 的 names 字段里给出）", unnamed)
 
     # ref_close 必须盖住"目标"和"现有持仓"的并集。
     # 漏掉现有持仓的价格，05 的 trade 阶段会把那个标的静默剔除 ——

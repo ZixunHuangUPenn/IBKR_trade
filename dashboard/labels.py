@@ -1,17 +1,45 @@
 """
 标的代码 -> 中文注释。
 
-纯查表，不依赖任何外部数据源 —— dashboard 上写着 "EFA"、"DBC" 这种代码，
+纯查表，不联网、不调 API —— dashboard 上写着 "EFA"、"DBC" 这种代码，
 不查一下根本不知道自己在回测什么。看错资产类别是很贵的错误：
 把 TLT（长债）当成 IEF（中债）选进标的池，久期差了一倍多，
 回测出来的波动和回撤完全不是一回事。
 
 查不到的代码不报错、不猜，原样显示代码 —— 宁可没注释，也不能给个错注释。
+
+两张表，优先级从高到低：
+
+  SYMBOLS       手写的。ETF 和少量个股，我自己核过，是权威。
+  symbol_names  agent 每天 commit 时登记的。它可以提名任意美股代码，
+                标的池不再是 config.DEFAULT_UNIVERSE 那十个 ETF 能框住的了 ——
+                持仓表里蹦出一个 "GE" 却只显示 "—"，你得自己去搜它现在
+                到底是什么公司（2024 年分拆后 GE 只剩航空发动机业务）。
+
+为什么 agent 写的不直接进这个文件：这里的每一行都会被 import 成 Python 代码。
+把模型生成的字符串拼进源码，等于给它开了一条在 dashboard 进程里执行任意代码的
+路 —— 一个交易仓库不该有这种东西。落到 JSON 里读进来，最坏也只是显示一个
+难看的名字。手写表永远盖过它，所以 agent 也改不了我核过的条目。
 """
 
 from __future__ import annotations
 
+import json
+import logging
 from typing import NamedTuple
+
+import config
+
+log = logging.getLogger("labels")
+
+# agent 登记的名字。放在 AGENT_DIR 而不是源码目录，是因为它是数据不是代码：
+# 删了不影响任何功能，只是名字变回代码而已。
+LEARNED_FILE = config.AGENT_DIR / "symbol_names.json"
+
+# 个股的资产类别用板块名，别用「美股」—— 组合里同时有 SPY 和 NVDA 时，
+# 按资产类别分组的那张饼图要看得出后者是集中的行业敞口，不是宽基。
+SECTORS = ("科技股", "通信股", "可选消费", "必需消费", "金融股", "医疗股",
+           "工业股", "能源股", "公用事业", "原材料", "房地产")
 
 
 class SymbolInfo(NamedTuple):
@@ -51,6 +79,14 @@ SYMBOLS: dict[str, SymbolInfo] = {
 
     # ---- 房地产 ----
     "VNQ": SymbolInfo("美国REITs", "房地产", "Vanguard Real Estate ETF，美国房地产信托，股债之间的第三类资产"),
+
+    # ---- 个股 ----
+    # 目前只登记 agent 已经持有的。其余的由它自己在 commit 时登记，见文件头。
+    "GE": SymbolInfo("GE航空航天", "工业股",
+                     "GE Aerospace。2024 年三分拆后只剩航空发动机，利润主要来自售后维修 —— "
+                     "已经不是那个什么都做的 GE 了，别照着旧印象给它归类"),
+    "JPM": SymbolInfo("摩根大通", "金融股",
+                      "美国最大的银行，投行/零售/资管全牌照，常被当作整个银行业的风向标"),
 }
 
 # 合成数据（scripts/00_offline_demo.py --save-cache 生成）。
@@ -67,12 +103,116 @@ SYNTH: dict[str, SymbolInfo] = {
 }
 
 
+# ---------------- agent 登记的名字 ----------------
+
+_learned: dict[str, SymbolInfo] = {}
+_learned_mtime: float | None = None
+
+
+def _learned_table() -> dict[str, SymbolInfo]:
+    """按 mtime 懒加载。
+
+    dashboard 是长驻进程，agent 每天都在写这个文件。只在 import 期读一次的话，
+    今天新登记的名字要等你重启 streamlit 才看得见 —— 而你不会想到要重启，
+    只会以为登记没生效。
+
+    这个文件坏掉不能影响任何东西：读不出来就退回上一次的结果，最坏是没有名字。
+    """
+    global _learned, _learned_mtime
+    try:
+        mtime = LEARNED_FILE.stat().st_mtime
+    except OSError:
+        return {}          # 还没有 agent 登记过 —— 正常状态，不是错误
+    if mtime == _learned_mtime:
+        return _learned
+
+    try:
+        raw = json.loads(LEARNED_FILE.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            raise ValueError("顶层不是一个对象")
+    except (json.JSONDecodeError, OSError, ValueError) as e:
+        log.warning("%s 读不出来（%s），继续用上一次的结果", LEARNED_FILE.name, e)
+        return _learned
+
+    table = {}
+    for code, v in raw.items():
+        if not isinstance(v, dict):
+            continue
+        i = _clean(v.get("name"), v.get("asset"), v.get("detail"))
+        if i:
+            table[str(code).strip().upper()] = i
+    _learned, _learned_mtime = table, mtime
+    return _learned
+
+
+def _clean(name, asset, detail) -> SymbolInfo | None:
+    """把一条外部来的登记洗干净。洗不出合法的名字就返回 None。
+
+    换行必须去掉：侧边栏的对照表是 markdown，名字里带个换行就能把整块排版
+    撑烂。长度也要卡 —— 中文简称是塞进下拉框的，模型很容易写成一句话。
+    """
+    def flat(x, limit):
+        return " ".join(str(x or "").split())[:limit]
+
+    n = flat(name, 20)
+    if not n:
+        return None
+    return SymbolInfo(n, flat(asset, 12) or "个股", flat(detail, 200))
+
+
+def register_many(entries: dict) -> tuple[list[str], list[str]]:
+    """把 agent 提交的中文名并进 symbol_names.json。返回 (新增的, 跳过的)。
+
+    两条不覆盖的规则：
+
+      SYMBOLS 里已有的     手写表是权威，agent 改不了我核过的条目。
+      已经登记过的         一只票的名字不该每天换一次说法，那会让你翻旧日志时
+                          对不上是同一只票。要改就人工改。
+
+    写文件失败**不抛异常**。这是显示层的东西，没有资格中断一次已经通过
+    全部硬约束校验的调仓 —— 和文件开头那个 stdout 编码的坑是同一个道理。
+    """
+    added, skipped = [], []
+    if not isinstance(entries, dict) or not entries:
+        return added, skipped
+
+    current = dict(_learned_table())
+    for code, v in entries.items():
+        sym = str(code).strip().upper()
+        if not sym:
+            continue
+        if sym in SYMBOLS or sym in current:
+            skipped.append(sym)
+            continue
+        i = _clean(v.get("name"), v.get("asset"), v.get("detail")) \
+            if isinstance(v, dict) else _clean(v, None, None)
+        if not i:
+            skipped.append(sym)
+            log.warning("%s 的登记没有可用的中文名，跳过", sym)
+            continue
+        current[sym] = i
+        added.append(sym)
+
+    if added:
+        try:
+            LEARNED_FILE.write_text(
+                json.dumps({k: v._asdict() for k, v in sorted(current.items())},
+                           indent=2, ensure_ascii=False),
+                encoding="utf-8")
+        except OSError as e:
+            log.warning("写不进 %s（%s）—— 名字没登记上，不影响交易",
+                        LEARNED_FILE.name, e)
+            return [], sorted(set(added) | set(skipped))
+    return added, skipped
+
+
 def info(symbol: str) -> SymbolInfo | None:
     """查不到返回 None，由调用方决定怎么降级显示。"""
     s = symbol.upper()
     if s.startswith(SYNTH_PREFIX):
         return SYNTH.get(s[len(SYNTH_PREFIX):])
-    return SYMBOLS.get(s)
+    # 手写表优先。agent 登记的只用来补它没覆盖到的代码。
+    return SYMBOLS.get(s) or _learned_table().get(s)
 
 
 def is_synthetic(symbol: str) -> bool:
