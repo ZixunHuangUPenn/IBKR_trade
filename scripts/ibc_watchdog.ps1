@@ -24,16 +24,21 @@
 
 param(
     [string]$IbcPath = "C:\IBC",
-    [switch]$WhatIfOnly      # 只报告状态，不启动
+    [int]$VerifySeconds = 90,   # 拉起之后等多久确认进程真的在了
+    [switch]$WhatIfOnly         # 只报告状态，不启动
 )
 
 $ErrorActionPreference = "Stop"
 
 $marker = "ibcalpha.ibc.IbcGateway"
-$running = Get-CimInstance Win32_Process -Filter "Name='java.exe'" -ErrorAction SilentlyContinue |
-           Where-Object { $_.CommandLine -and $_.CommandLine.Contains($marker) }
 
-$stamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+function Get-GatewayProcess {
+    Get-CimInstance Win32_Process -Filter "Name='java.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -and $_.CommandLine.Contains($marker) }
+}
+
+$running = Get-GatewayProcess
+$stamp   = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
 
 if ($running) {
     $pids = ($running | ForEach-Object { $_.ProcessId }) -join ","
@@ -58,4 +63,25 @@ if (-not (Test-Path $bat)) { throw "找不到 $bat" }
 
 Write-Output "$stamp  Gateway 未运行，正在拉起 $bat"
 Start-Process -FilePath $bat -WorkingDirectory $IbcPath -WindowStyle Minimized
-exit 0
+
+# 拉起之后必须确认它真的起来了，不能发完命令就退出 0。
+# 启动会失败：配置文件放错位置（ERRORLEVEL 1006）、IBC 版本和 Gateway 对不上、
+# 磁盘满。这些情况下 bat 一样会"正常返回"，看门狗要是跟着报成功，
+# 计划任务的"失败后重试"就永远不会触发 —— 等于没有重试。
+# 实测拉起 + 自动登录 18 秒，给到 90 秒是留够 2FA 和冷启动的余量。
+$deadline = (Get-Date).AddSeconds($VerifySeconds)
+while ((Get-Date) -lt $deadline) {
+    Start-Sleep -Seconds 3
+    $up = Get-GatewayProcess
+    if ($up) {
+        $pids = ($up | ForEach-Object { $_.ProcessId }) -join ","
+        $stamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        Write-Output "$stamp  已拉起 (PID $pids)"
+        exit 0
+    }
+}
+
+# 退出码非 0 是给任务计划器看的信号：它会按 RestartInterval 每 5 分钟再来一次。
+$stamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+Write-Output "$stamp  拉起后 $VerifySeconds 秒内没看到 Gateway 进程 —— 判定失败，等待重试"
+exit 1
