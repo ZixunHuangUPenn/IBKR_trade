@@ -80,6 +80,22 @@ SYMBOLS: dict[str, SymbolInfo] = {
     # ---- 房地产 ----
     "VNQ": SymbolInfo("美国REITs", "房地产", "Vanguard Real Estate ETF，美国房地产信托，股债之间的第三类资产"),
 
+    # ---- 行业板块 ETF（SPDR Select Sector）----
+    # 这一族整体登记，不等 agent 一只一只报。它是拆开的 SPY：11 只加起来
+    # 就是标普500，所以 agent 想表达"看好某个板块"时几乎必然从这里选 ——
+    # 与其等它漏报一次、dashboard 上就空一格，不如一次写全。
+    "XLK": SymbolInfo("科技板块", "美股", "Technology Select Sector SPDR，标普500里的科技股，权重高度集中在苹果和微软"),
+    "XLV": SymbolInfo("医疗板块", "美股", "Health Care Select Sector SPDR，药企+器械+医疗服务，防御性板块，和大盘相关性偏低"),
+    "XLF": SymbolInfo("金融板块", "美股", "Financial Select Sector SPDR，银行/保险/资管，对利率和信用周期敏感"),
+    "XLE": SymbolInfo("能源板块", "美股", "Energy Select Sector SPDR，石油天然气为主，跟油价走，和其余板块常常反着动"),
+    "XLI": SymbolInfo("工业板块", "美股", "Industrial Select Sector SPDR，航空/机械/运输/国防，典型的顺周期"),
+    "XLY": SymbolInfo("可选消费", "美股", "Consumer Discretionary Select Sector SPDR，亚马逊和特斯拉占了很大权重"),
+    "XLP": SymbolInfo("必需消费", "美股", "Consumer Staples Select Sector SPDR，食品日用品，衰退里最抗跌的板块之一"),
+    "XLU": SymbolInfo("公用事业", "美股", "Utilities Select Sector SPDR，高股息低增长，走势更像债券而不是股票"),
+    "XLB": SymbolInfo("原材料", "美股", "Materials Select Sector SPDR，化工/金属/建材，跟大宗商品和全球制造业周期"),
+    "XLRE": SymbolInfo("房地产板块", "美股", "Real Estate Select Sector SPDR，标普500里的 REITs，比 VNQ 窄"),
+    "XLC": SymbolInfo("通信服务", "美股", "Communication Services Select Sector SPDR，2018年新设，实际是 Meta+Alphabet 加一堆媒体"),
+
     # ---- 个股 ----
     # 目前只登记 agent 已经持有的。其余的由它自己在 commit 时登记，见文件头。
     "GE": SymbolInfo("GE航空航天", "工业股",
