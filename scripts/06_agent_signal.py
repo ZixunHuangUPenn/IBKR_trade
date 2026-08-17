@@ -31,7 +31,7 @@ import argparse
 import json
 import logging
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -44,6 +44,7 @@ from ibkr import account as acct
 from ibkr.connection import IBConnection
 from ibkr.market_data import download_bars, load_bars
 from notify import notify
+from scripts_util import resolve_as_of
 
 ET = ZoneInfo("America/New_York")
 
@@ -104,12 +105,28 @@ def _dump(path: Path, obj) -> None:
 # ---------------------------------------------------------------- prepare
 
 def stage_prepare(args) -> int:
-    now_et = datetime.now(ET)
-    log.info("prepare 阶段启动，美东时间 %s %s", now_et.strftime("%Y-%m-%d %H:%M"),
+    # as_of = 作业启动的时刻，now_et = 此刻。正常情况下两者差几秒，机器中途
+    # 休眠时能差好几个小时。交易日历问 as_of，数据新鲜度问 now_et ——
+    # 为什么必须分开，见 scripts_util.resolve_as_of。
+    as_of, now_et, delay = resolve_as_of(args.as_of, ET)
+    log.info("prepare 阶段启动，美东时间 %s %s", as_of.strftime("%Y-%m-%d %H:%M"),
              "[dry-run 验证模式]" if args.dry_run else "")
 
-    if now_et.weekday() >= 5 and not args.dry_run:
-        log.info("美东是周末，美股不开市。今天不决策。")
+    if delay > timedelta(minutes=30):
+        # 这件事以前是完全看不见的：2026-08-14 周五启动的作业睡到周六才醒，
+        # 被判成"周末不决策"、退出码 0，日志一片绿，那天的信号就没了。
+        # 判定本身下面已经修好了，但"作业被拖了 8 小时"这个事实本身也得有人知道。
+        msg = (f"作业在美东 {as_of:%m-%d %H:%M} 启动，到 {now_et:%m-%d %H:%M} "
+               f"才跑到第一步，中间隔了 {delay.total_seconds() / 3600:.1f} 小时 —— "
+               f"多半是机器休眠了。\n"
+               f"交易日历按启动时刻 {as_of:%Y-%m-%d}（周{as_of.isoweekday()}）判，"
+               f"数据新鲜度仍按此刻判。")
+        log.warning(msg)
+        notify("AI 作业启动后被拖延", msg, level="warn")
+
+    if as_of.weekday() >= 5 and not args.dry_run:
+        log.info("美东是周末（按启动时刻 %s 判定），美股不开市。今天不决策。",
+                 as_of.strftime("%Y-%m-%d"))
         return SKIP
 
     reason = policy.halted()
@@ -133,7 +150,7 @@ def stage_prepare(args) -> int:
         log.error(msg)
         notify("AI 交易熔断：回撤超限", msg, level="error")
         policy.HALT_FILE.write_text(
-            f"净值回撤 {dd:.1%} 触发熔断（{now_et:%Y-%m-%d}）。人工确认后删除本文件。",
+            f"净值回撤 {dd:.1%} 触发熔断（{as_of:%Y-%m-%d}）。人工确认后删除本文件。",
             encoding="utf-8")
         return SKIP
 
@@ -193,14 +210,19 @@ def stage_prepare(args) -> int:
     # （"可能是假日"）看起来完全合理 —— 这种错最难发现。
     if spy is not None and not args.dry_run:
         last_bar = spy.index[-1].date()
-        after_close = now_et.hour >= 16
+        # "收盘前还是收盘后""该不该有当天的日线"都是日历问题，按 as_of 判 ——
+        # 作业睡到半夜才醒的话，用 now_et 会把一份完全正常的收盘后作业
+        # 误判成"凌晨补跑"，或者反过来判成"已过收盘却没有今天的日线"。
+        after_close = as_of.hour >= 16
+        # 而"数据是不是已经旧到不能用"只能问墙上的钟。这里用 as_of 的话，
+        # 一次睡了三天的作业会算出 0 天，把真正的数据管道故障藏起来。
         stale_days = (now_et.date() - last_bar).days
 
-        if after_close and last_bar != now_et.date():
-            log.warning("SPY 最后一根日线是 %s，不是今天（%s）。已过收盘时点却没有"
-                        "今天的日线：可能是美股假日，也可能跑得太早。今天不决策。",
-                        last_bar, now_et.date())
-            notify("AI 今日不决策", f"SPY 最后一根日线 {last_bar}，非今日。"
+        if after_close and last_bar != as_of.date():
+            log.warning("SPY 最后一根日线是 %s，不是作业当天（%s）。已过收盘时点却没有"
+                        "当天的日线：可能是美股假日，也可能跑得太早。今天不决策。",
+                        last_bar, as_of.date())
+            notify("AI 今日不决策", f"SPY 最后一根日线 {last_bar}，非 {as_of.date()}。"
                                     f"检查是否假日或作业时间过早。", level="warn")
             return SKIP
 
@@ -215,11 +237,11 @@ def stage_prepare(args) -> int:
             return SKIP
 
         if not after_close:
-            log.info("当前是美东 %s（收盘前），最新日线只可能是上一个交易日。"
+            log.info("作业启动于美东 %s（收盘前），最新日线只可能是上一个交易日。"
                      "以 %s 的收盘作为信号日，下一个开盘执行 —— 这就是 lag=1。",
-                     now_et.strftime("%H:%M"), last_bar)
+                     as_of.strftime("%H:%M"), last_bar)
 
-    signal_date = str(spy.index[-1].date()) if spy is not None else str(now_et.date())
+    signal_date = str(spy.index[-1].date()) if spy is not None else str(as_of.date())
 
     # ------- 组合状态。权重一律以 NAV 为分母（positions_df 的 weight 是以持仓
     # 市值为分母的，两者在有现金时差别很大，混用会让换手率算错）。
@@ -290,7 +312,7 @@ def stage_prepare(args) -> int:
         PROPOSAL.unlink()
 
     CONTEXT.write_text(
-        datapack.build_context(state, bench_stats, held_stats, now_et,
+        datapack.build_context(state, bench_stats, held_stats, as_of,
                                policy.limits_text()),
         encoding="utf-8")
 
@@ -515,6 +537,10 @@ def main() -> int:
     ap.add_argument("--symbols", default="", help="fetch 阶段：逗号分隔的代码")
     ap.add_argument("--dry-run", action="store_true",
                     help="prepare：无视周末/日线日期检查；commit：校验但不写信号")
+    ap.add_argument("--as-of", default="",
+                    help="prepare：作业启动时刻（ISO 8601，如 2026-08-14T18:40:00-04:00）。"
+                         "交易日历按它判，不按进程醒过来的时刻 —— 机器休眠时两者能差"
+                         "好几个小时。留空则退回本进程创建时间。")
     args = ap.parse_args()
 
     if args.stage == "fetch" and not args.symbols:
