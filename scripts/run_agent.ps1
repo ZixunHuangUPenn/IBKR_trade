@@ -43,6 +43,15 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# 作业启动的时刻，往下传给 prepare。
+#
+# 机器中途睡过去的话，python 进程可能几小时后才跑到第一行判断，那时"今天
+# 星期几"已经变了。2026-08-14 就是这么丢掉一天的：周五 18:40 ET 启动，
+# 周六 02:57 ET 才醒，被判成"周末不决策"，退出码 0，日志一片绿。
+# 交易日历要按这一刻判，不按 python 醒过来的那一刻。
+$startedAt = Get-Date
+$asOf      = $startedAt.ToString("yyyy-MM-ddTHH:mm:ssK")
+
 $root    = Split-Path -Parent $PSScriptRoot
 $python  = Join-Path $root ".venv\Scripts\python.exe"
 $job     = Join-Path $root "scripts\06_agent_signal.py"
@@ -53,7 +62,7 @@ $agentDir= Join-Path $root "data\agent"
 if (-not (Test-Path $logDir))   { New-Item -ItemType Directory -Force $logDir   | Out-Null }
 if (-not (Test-Path $agentDir)) { New-Item -ItemType Directory -Force $agentDir | Out-Null }
 
-$logFile = Join-Path $logDir ("{0:yyyy-MM-dd}_agent_run.log" -f (Get-Date))
+$logFile = Join-Path $logDir ("{0:yyyy-MM-dd}_agent_run.log" -f $startedAt)
 
 function Write-Log {
     param([string]$Message, [string]$Level = "INFO")
@@ -118,7 +127,7 @@ Write-Log "claude : $claude  (model=$Model, 预算上限 `$$MaxBudgetUsd)"
 Set-Location $root
 
 # ------------------------------------------------------- ① 备料
-$prepArgs = @($job, "--stage", "prepare")
+$prepArgs = @($job, "--stage", "prepare", "--as-of", $asOf)
 if ($DryRun) { $prepArgs += "--dry-run" }
 
 & $python $prepArgs
@@ -237,6 +246,35 @@ if (Test-Path $stdoutFile) {
         # 正则要用单引号。写成 "`r?`n" 的话反引号先被 PowerShell 解释成真的
         # CR / LF 字符，交给 -replace 的就不是 \r?\n 这个模式了。
         if ($res.result) { Write-Log ("agent 结语：" + ($res.result -replace '\r?\n', ' | ')) }
+
+        # "claude 自己没跑起来"和"agent 想了想决定今天不动"是两码事，但它们最后
+        # 都只表现为一件事：没有 proposal.json。于是共用 commit 那条模糊告警
+        # （"可能是它跑挂了、超时了，或者判断今天不该动"）。
+        #
+        # 2026-08-10 起那条告警连响四天，没人从里面看出来其实是订阅权限被关了
+        # （HTTP 403，num_turns=1，一分钱没花），AI 选股就这么停摆了整整一周。
+        # 信息一直在 claude 的 JSON 输出里，只是没人把它喊出来 —— 现在喊。
+        if ($res.is_error) {
+            $detail = ("" + $res.result) -replace '\r?\n', ' '
+            $status = $res.api_error_status
+            if ($status -eq 401 -or $status -eq 403) {
+                $title = "claude 认证失效，AI 选股已停摆"
+                $body  = ("claude 返回 HTTP $status，一轮都没跑起来：$detail`n`n" +
+                          "这不是策略问题，agent 根本没启动。修好之前每天都不会有信号，" +
+                          "仓位会一直停在最后一次调仓的状态。`n" +
+                          "查：跑一次 'claude setup-token' 重新生成长期 token，" +
+                          "或者在 .env 里配 ANTHROPIC_API_KEY。")
+            } elseif ($null -ne $status) {
+                $title = "claude 调用失败（HTTP $status）"
+                $body  = "claude 返回 HTTP $status：$detail`n`nagent 没有决策，今天不会有信号。"
+            } else {
+                $title = "claude 调用失败"
+                $body  = ("claude 报错退出（terminal_reason=$($res.terminal_reason)）：$detail" +
+                          "`n`nagent 没有决策，今天不会有信号。")
+            }
+            Write-Log "$title —— $detail" "ERROR"
+            Send-Alert $title $body
+        }
     } catch {
         Write-Log "解析 claude 输出失败（不影响后续，提案文件才是准的）：$_" "WARN"
     }

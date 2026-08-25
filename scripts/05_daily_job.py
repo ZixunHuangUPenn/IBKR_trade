@@ -26,7 +26,7 @@ import argparse
 import json
 import logging
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -40,7 +40,7 @@ from ibkr.market_data import (download_universe, load_universe_prices,
                               make_contract)
 from ibkr.reconcile import reconcile
 from notify import notify
-from scripts_util import parse_params
+from scripts_util import parse_params, resolve_as_of
 from strategies import REGISTRY, build
 
 ET = ZoneInfo("America/New_York")
@@ -84,14 +84,24 @@ def setup_logging(stage: str) -> Path:
 # ---------------------------------------------------------------- signal 阶段
 
 def stage_signal(args) -> int:
-    now_et = datetime.now(ET)
-    log.info("signal 阶段启动，美东时间 %s（周%d）%s", now_et.strftime("%Y-%m-%d %H:%M"),
-             now_et.isoweekday(), "[dry-run 验证模式]" if args.dry_run else "")
+    # as_of = 作业启动的时刻，now_et = 此刻。机器中途休眠时两者能差好几个小时，
+    # 而"今天该不该出信号"在启动那一刻就有答案了 —— 详见 scripts_util.resolve_as_of。
+    as_of, now_et, delay = resolve_as_of(args.as_of, ET)
+    log.info("signal 阶段启动，美东时间 %s（周%d）%s", as_of.strftime("%Y-%m-%d %H:%M"),
+             as_of.isoweekday(), "[dry-run 验证模式]" if args.dry_run else "")
+
+    if delay > timedelta(minutes=30):
+        msg = (f"作业在美东 {as_of:%m-%d %H:%M} 启动，到 {now_et:%m-%d %H:%M} 才跑到"
+               f"第一步，中间隔了 {delay.total_seconds() / 3600:.1f} 小时 —— "
+               f"多半是机器休眠了。交易日历按启动时刻判。")
+        log.warning(msg)
+        notify("信号作业启动后被拖延", msg, level="warn")
 
     # dry-run 只是为了在搭建当天（很可能是周末）验证管道能不能跑通。
     # 它跑完整流程但不写 pending.json，所以永远不可能导致一笔交易。
-    if now_et.weekday() >= 5 and not args.dry_run:
-        log.info("美东是周末，美股不开市。不产生信号，正常退出。")
+    if as_of.weekday() >= 5 and not args.dry_run:
+        log.info("美东是周末（按启动时刻 %s 判定），美股不开市。不产生信号，正常退出。",
+                 as_of.strftime("%Y-%m-%d"))
         return 0
 
     symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
@@ -112,13 +122,14 @@ def stage_signal(args) -> int:
     prices = load_universe_prices(symbols)
     last_bar = prices.index[-1].date()
 
-    if last_bar != now_et.date() and not args.dry_run:
-        # 工作日但没有今天的日线：要么是美股假日，要么 IBKR 的日线还没结算出来。
+    if last_bar != as_of.date() and not args.dry_run:
+        # 工作日但没有作业当天的日线：要么是美股假日，要么 IBKR 的日线还没结算出来。
         # 两种情况都不该硬着头皮出信号 —— 那会拿昨天的收盘当今天用。
-        log.warning("最后一根日线是 %s，不是今天（%s）。可能是美股假日，"
-                    "也可能是收盘后跑得太早。不产生信号。", last_bar, now_et.date())
-        notify("今日无信号", f"最后一根日线 {last_bar}，非今日。检查是否假日或作业时间过早。",
-               level="warn")
+        # 比的是 as_of 不是 now_et：作业睡到隔天凌晨才醒时，"今天"已经不是它那天了。
+        log.warning("最后一根日线是 %s，不是作业当天（%s）。可能是美股假日，"
+                    "也可能是收盘后跑得太早。不产生信号。", last_bar, as_of.date())
+        notify("今日无信号", f"最后一根日线 {last_bar}，非 {as_of.date()}。"
+                             f"检查是否假日或作业时间过早。", level="warn")
         return 0
 
     params = parse_params(args.params)
@@ -375,6 +386,9 @@ def main() -> int:
     ap.add_argument("--duration", default="5 Y")
     ap.add_argument("--dry-run", action="store_true",
                     help="signal 阶段：跑完整流程但不写信号文件，用于搭建当天验证管道")
+    ap.add_argument("--as-of", default="",
+                    help="signal 阶段：作业启动时刻（ISO 8601）。交易日历按它判，"
+                         "不按进程醒过来的时刻。留空则退回本进程创建时间。")
     # trade 阶段
     ap.add_argument("--execute", action="store_true", help="真正发送订单")
     ap.add_argument("--order-type", default="LMT", choices=["LMT", "MKT"])
