@@ -78,6 +78,13 @@ function Send-Alert {
     catch { Write-Log "告警发送失败（不影响作业）：$_" "WARN" }
 }
 
+# ---------------------------------------------------------------- 别让机器睡了
+#
+# 8/24 那次作业就是被 Modern Standby 掐断的。逻辑跟 run_trade.ps1 共用一份 ——
+# 关盖动作是全局状态，两份会互相把对方的原值覆盖掉，细节见模块头。
+# 契约：点源之前必须已经定义好 Write-Log 和 Send-Alert。
+. (Join-Path $PSScriptRoot "power_hold.ps1")
+
 # ---------------------------------------------------------------- 找 claude
 function Resolve-ClaudeBin {
     if ($ClaudeBin -ne "") {
@@ -123,6 +130,17 @@ Write-Log ("=" * 60)
 Write-Log "AI 自主选股作业启动$(if ($DryRun) { ' [dry-run]' })"
 Write-Log "python : $python"
 Write-Log "claude : $claude  (model=$Model, 预算上限 `$$MaxBudgetUsd)"
+
+Enter-PowerHold
+
+# 从这里到脚本结尾包在 try/finally 里 —— 四条 exit 路径不管走哪条，关盖策略
+# 都得还回去。
+#
+# 主体故意**不缩进**：下面 $kickoff 那个 here-string 的结束符 "@ 必须顶格，
+# 一缩进它就不再是结束符，整份 prompt 会被弄坏（而且是安静地坏 —— 8/04 已经
+# 用另一种方式踩过一次"prompt 被截断但退出码 0"了）。PowerShell 不看缩进，
+# 这样写和缩进版完全等价。
+try {
 
 Set-Location $root
 
@@ -304,3 +322,9 @@ if ($rc -ne 0) {
 
 Write-Log "完成。信号已就绪，等次日 05_daily_job.py --stage trade 执行。"
 exit 0
+
+} finally {
+    # exit 也会走到这里。走不到的只剩硬杀（8/24 那种控制台被关），
+    # 那种情况由 data/lid_restore.txt 兜底：下次启动第一件事就是还原。
+    Exit-PowerHold
+}
