@@ -66,6 +66,7 @@ $root       = Split-Path -Parent $PSScriptRoot
 $python     = Join-Path $root ".venv\Scripts\python.exe"
 $job        = Join-Path $root "scripts\05_daily_job.py"
 $runAgent   = Join-Path $root "scripts\run_agent.ps1"
+$runTrade   = Join-Path $root "scripts\run_trade.ps1"
 $psExe      = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
 $signalName = "$TaskPrefix-Signal"
 $tradeName  = "$TaskPrefix-Trade"
@@ -87,6 +88,7 @@ if ($Remove) {
 # ---------------------------------------------------------------- 前置检查
 if (-not (Test-Path $python)) { throw "找不到虚拟环境的 python: $python" }
 if (-not (Test-Path $job))    { throw "找不到作业脚本: $job" }
+if (-not (Test-Path $runTrade)) { throw "找不到执行编排脚本: $runTrade" }
 if ($Agent -and -not (Test-Path $runAgent)) { throw "找不到 AI 编排脚本: $runAgent" }
 
 # ------------------------------------------------- 美东时间 -> 本机时间
@@ -125,8 +127,10 @@ if ($Agent) {
     $stratLabel = "$Strategy $Params"
 }
 
-$tradeArgs = "`"$job`" --stage trade --order-type $OrderType"
-if ($Execute) { $tradeArgs += " --execute" }
+# Trade 也走 PowerShell 壳，不再直接调 python —— 壳里那层「别让机器睡了」
+# 需要一个能盖住整段 python 执行的进程来持有。交易逻辑本身一行没改。
+$tradeArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$runTrade`" -OrderType $OrderType"
+if ($Execute) { $tradeArgs += " -Execute" }
 
 # ---------------------------------------------------------------- 注册
 function Register-JobTask {
@@ -137,10 +141,16 @@ function Register-JobTask {
     $trigger = New-ScheduledTaskTrigger -Daily -At $At
 
     # StartWhenAvailable  机器当时睡着/关着，醒来后补跑（无人值守的关键）
+    # WakeToRun           到点自己把机器唤醒，不用等你开盖
     # Restart*            任务失败自动重试 —— Gateway 重启窗口、网络抖动都靠它
     # IgnoreNew           上一次还没跑完就不要再起一个，避免重复下单
+    #
+    # WakeToRun 单独打开是不够的：电源计划里的「允许唤醒定时器」在**电池模式下
+    # 默认是关的**（RTCWAKE: AC=1, DC=0），而笔记本恰恰最可能在电池上过夜。
+    # 下面会一并把 DC 那一档打开，否则这个开关是个哑弹。
     $settings = New-ScheduledTaskSettingsSet `
         -StartWhenAvailable `
+        -WakeToRun `
         -RestartInterval (New-TimeSpan -Minutes 10) `
         -RestartCount 5 `
         -ExecutionTimeLimit (New-TimeSpan -Hours 2) `
@@ -148,14 +158,37 @@ function Register-JobTask {
         -AllowStartIfOnBatteries `
         -DontStopIfGoingOnBatteries
 
+    # 刻意**不**提权。run_agent.ps1 作业期间要用 powercfg 改关盖动作，一开始
+    # 以为得 Highest 级，实测不用 —— 改当前用户自己的电源方案本来就不需要管理员。
+    # 这件事值得写下来：Signal 任务里跑的是一个拿着 Bash、--permission-mode
+    # dontAsk 的 agent。给它一个提权进程，等于把沙箱封条之外的爆炸半径白白放大
+    # 一圈，换来的却是一个它根本不需要的权限。
     Register-ScheduledTask -TaskName $Name -Action $action -Trigger $trigger `
         -Settings $settings -Description $Description -Force | Out-Null
 }
 
+function Enable-WakeTimersOnBattery {
+    <#
+        打开电池模式下的唤醒定时器。没有它，WakeToRun 在电池上不会生效 ——
+        而 2026-08-24 那次作业迟到 32 分钟（要等人开盖才补跑）就是这么来的。
+    #>
+    $old = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        & powercfg /setdcvalueindex SCHEME_CURRENT SUB_SLEEP RTCWAKE 1 | Out-Null
+        if ($LASTEXITCODE -ne 0) { return $false }
+        & powercfg /setactive SCHEME_CURRENT | Out-Null
+        return ($LASTEXITCODE -eq 0)
+    } catch { return $false }
+    finally { $ErrorActionPreference = $old }
+}
+
 Register-JobTask -Name $signalName -Exe $signalExe -Arguments $signalArgs `
     -At $signalLocal -Description $signalDesc
-Register-JobTask -Name $tradeName -Exe $python -Arguments $tradeArgs `
+Register-JobTask -Name $tradeName -Exe $psExe -Arguments $tradeArgs `
     -At $tradeLocal -Description "IBKR 日常作业：读取待执行信号，下单并对账"
+
+$wakeOk = Enable-WakeTimersOnBattery
 
 # ---------------------------------------------------------------- 汇总
 $mode = "预演（不下单）"
@@ -175,6 +208,15 @@ Write-Host "  - 任务只在你登录着的时候跑。IB Gateway 本来就是 G
 Write-Host "    这台机器无论如何都得保持登录状态，所以这不是额外限制。"
 Write-Host "  - 本机时区若不随美国一起进出夏令时，每年三月和十一月要重跑一次本脚本。"
 Write-Host "  - Gateway 的 auto-restart 时间不要落在上面两个时点附近。"
+if ($wakeOk) {
+    Write-Host "  - 已打开电池模式下的唤醒定时器，两个任务都会把机器叫醒来跑。"
+} else {
+    Write-Host "  - 电池模式下的唤醒定时器没打开成功，电池上机器不会自己醒："  -ForegroundColor Yellow
+    Write-Host "    powercfg /setdcvalueindex SCHEME_CURRENT SUB_SLEEP RTCWAKE 1" -ForegroundColor Yellow
+}
+Write-Host "  - 两个任务跑的时候都会临时把「合盖」改成不休眠，跑完立刻还原（崩了的话"
+Write-Host "    下次启动第一件事就是还原）。**只动交流电那一档** —— 电池下合盖照睡，"
+Write-Host "    免得笔记本在包里空转到发烫。所以想关盖走人，记得插着电。"
 if ($Agent) {
     Write-Host "  - claude 必须能在无人值守时通过认证。跑一次 'claude setup-token'"
     Write-Host "    生成长期 token，别等到某天凌晨才发现它在等你登录。"
