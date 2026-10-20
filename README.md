@@ -179,11 +179,14 @@ rebalancer.py          你原有的再平衡脚本（保留）
 你没意识到的时序偏移换来的，这种偏差最难发现，也最不可能持续。
 
 ```
-signal 阶段（美东 17:10，收盘后）  更新数据 → 算目标权重 → 写 data/signals/pending.json
-trade  阶段（美东 09:45，次日开盘后）读信号 → 撤残单 → 下单 → 对账 → 归档
+08:45  看门狗拉起 Gateway
+08:50  signal 读取上一交易日完整日线 → 算目标权重 → 写 pending.json
+09:45  trade 撤残单 → 下单 → 对账 → 归档 → 优雅关闭 Gateway
+10:00  兜底关闭（若 trade 仍在运行则等待，绝不在交易中途强关）
 ```
 
-顺带一个好处：信号先落盘，你晚上可以先看一眼再让它第二天执行。
+信号日仍是上一交易日，开盘后持有，严格保持 `lag=1`；只是把“收盘后算”移动到
+“次日开盘前算”，使用的数据没有变化。
 
 ### 搭起来
 
@@ -191,7 +194,7 @@ trade  阶段（美东 09:45，次日开盘后）读信号 → 撤残单 → 下
 # 1. 先验证管道（跑完整流程但不写信号，因此绝不会产生交易；周末也能验）
 python scripts\05_daily_job.py --stage signal --strategy 横截面动量 --dry-run
 
-# 2. 注册两个计划任务。时点填**美东时间**，脚本自动换算成本机时区。
+# 2. 注册四个计划任务。时点填**美东时间**，脚本自动换算成本机时区。
 #    默认 trade 阶段只预演，不下单。
 .\scripts\setup_task.ps1 -Strategy 横截面动量
 
@@ -220,7 +223,7 @@ Get-ScheduledTaskInfo -TaskName IBKR-Signal | Select LastRunTime,LastTaskResult
 | 周末触发（周五的信号还在 pending 里） | trade 阶段直接退出，**不消费信号**，留到周一 |
 | 美股假日 | 向 IBKR 查 `liquidHours` 判断休市，保留信号退出；signal 阶段则因日线不是今天而不产生信号 |
 | signal 作业挂了好几天 | trade 阶段检查信号年龄，超过 4 天拒绝执行并告警 |
-| signal 和 trade 同一天跑了 | 拒绝执行（那等于 lag=0，破坏回测时序） |
+| 信号日就是交易日 | 拒绝执行（那等于 lag=0，破坏回测时序） |
 | 昨天的限价单没成交还挂着 | 下单前先 `cancel_all`，否则会和今天的新单叠成超额仓位 |
 | 下完单仓位没到位 | `ibkr/reconcile.py` 对账，偏差超容忍度就告警（**只告警，不自动补单**） |
 | 上次还没跑完又到点了 | 任务的 `MultipleInstances IgnoreNew` |
@@ -289,15 +292,10 @@ AcceptIncomingConnectionAction=accept   # 不弹 API 连接确认框
 IbLoginId= / IbPassword=                # 自己填
 ```
 
-自启与自愈都走 `scripts/ibc_watchdog.ps1`：
-
-- 启动文件夹的 `IBC Gateway.lnk` —— 登录后立刻检查并拉起
-- 计划任务 `IBC-Gateway` —— **每天只跑两次**，各在 Signal / Trade 作业前一小时
-
-不是每 N 分钟轮询一次，是**只在需要 Gateway 之前才检查**。理由很简单：
-除了那两个时点，Gateway 在不在跑都没人关心；轮询买来的那点"更早发现"，
-换的是一天几百次唤醒。留一小时提前量是因为拉起 + 自动登录实测 18 秒就够，
-一小时足够容纳一次失败后你自己介入。
+启停都由 `setup_task.ps1` 管理：`IBC-Gateway` 每天 08:45 通过
+`scripts/ibc_watchdog.ps1` 拉起；trade 正常结束后调用 `scripts/ibc_stop.ps1`
+优雅关闭；`IBC-Gateway-Stop` 在 10:00 再兜底一次。不是每 N 分钟轮询，Gateway
+只在早间决策和交易窗口运行。看门狗失败时才按计划任务的重试策略再次尝试。
 
 **不能让计划任务直接跑 `StartGateway.bat`**：它内部用 `start` 派生独立窗口后立即返回，
 任务几秒就结束，`MultipleInstances=IgnoreNew` 那道防护完全落空 ——
@@ -310,9 +308,8 @@ IbLoginId= / IbPassword=                # 自己填
 
 实测：看门狗一旦触发，杀掉的 Gateway 进程 18 秒内就能重新拉起并完成自动登录。
 
-**失败会自动重试，每 5 分钟一次，最多 11 次**（任务的 `RestartInterval`），
-正好覆盖到作业开跑前的那一小时。所以"只跑两次"不等于"只有两次机会" ——
-不失败就真的只跑两次，失败了才会开始每 5 分钟敲一次门。
+**失败会自动重试**（任务的 `RestartInterval`）。不失败就每天只启动一次，失败了
+才会按间隔重试。
 
 要让重试真正起作用，脚本必须**如实报告失败**，这是它退出码的全部意义：
 
@@ -333,17 +330,7 @@ IbLoginId= / IbPassword=                # 自己填
 Get-ScheduledTaskInfo -TaskName IBC-Gateway | Select LastRunTime,LastTaskResult
 ```
 
-时点是从 `IBKR-Signal` / `IBKR-Trade` 的实际触发时间各减一小时算出来的。
-**重跑 `setup_task.ps1` 改了作业时点（含每年两次的夏令时换算）之后，
-这两个触发器不会自动跟着走**，得重新设一遍：
-
-```powershell
-$sig = ([datetime](Get-ScheduledTask -TaskName IBKR-Signal).Triggers[0].StartBoundary).AddHours(-1)
-$trd = ([datetime](Get-ScheduledTask -TaskName IBKR-Trade ).Triggers[0].StartBoundary).AddHours(-1)
-Set-ScheduledTask -TaskName IBC-Gateway -Trigger @(
-    (New-ScheduledTaskTrigger -Daily -At $sig),
-    (New-ScheduledTaskTrigger -Daily -At $trd))
-```
+四个时点都由 `setup_task.ps1` 一次注册；修改时点或本机时区后重跑脚本即可一起更新。
 
 > ⚠️ `config.ini` 里是**明文密码**。文件 ACL 已收窄到当前用户，但这台机器的安全
 > 就等于你的 IBKR 安全。上实盘前给 Gateway 单独建一个 IBKR username。
@@ -356,14 +343,88 @@ Set-ScheduledTask -TaskName IBC-Gateway -Trigger @(
 - 本机时区若不随美国一起进出夏令时（比如机器在国内），每年三月和十一月
   要重跑一次 `setup_task.ps1` 让它重新换算。
 - 同一个 IBKR username 不能两处登录。Gateway 挂着的时候你再用手机 App 登录会
-  互相踢掉，自动交易就断了。去官网 `Settings → Users & Access Rights`
-  加一个 username 专供 Gateway，日常自己用另一个。
+  互相踢掉，自动交易就断了。解决办法见下一节。
+
+---
+
+### 上实盘：给机器人一个独立 username
+
+**不是开新账户，是在现有账户下加一个用户名。** 这个区别在配置里看得见：
+
+| 概念 | 配在哪 | 加用户后 |
+|---|---|---|
+| **账户** `U1234567` | `.env` 的 `IB_ACCOUNT` | **不变** |
+| **用户名**（登录凭据） | IBC `config.ini` 的 `IbLoginId` / `IbPassword` | 改成新用户名 |
+
+一个账户、一份资金、一套持仓、一个报税主体，只是多了一把钥匙。开新**账户**会把
+资金切成两半，那是另一回事，别做。
+
+办法：客户端门户 → `Settings → Users & Access Rights → Add User`。
+然后按角色分工：
+
+- **机器人 username**：只有服务器上的 Gateway 用它登录，你永远不碰
+- **你自己的主 username**：手机 App、网页版随便登，不影响 Gateway
+
+两个不同用户名可以同时在线。`ExistingSessionDetectedAction=primary` 留着仍有用 ——
+万一 Gateway 留了个僵尸会话，它让新实例抢回来。
+
+#### 给机器人 username 什么权限
+
+IBKR 的权限项名称按账户类型和地区有出入。找不到完全对应的条目时，判据是一句话：
+**能下单、能读账户；不能动钱、不能改权限。**
+
+**必须给**（不给就跑不起来）
+
+- [ ] **交易权限**（下单 / 改单 / 撤单）
+- [ ] 产品类别**只勾美股（含 ETF）** —— 策略只做这个
+- [ ] **账户数据读取**：持仓、余额、净值、订单状态
+      —— `accountSummary` / `positions` / `openOrders` 是每天对账的输入，
+      读不到的话 `reconcile` 直接失效，而它是本项目唯一可信的"仓位到底对没对"的来源
+- [ ] 若买了实时行情：把**行情订阅分配到这个 user**（见下面的坑）
+
+**必须不给**（这是凭据泄露时的止血点，逐条都有理由）
+
+- [ ] ✗ **出金 / 资金划转 / 银行指令** —— 最重要的一条。泄露了也搬不走钱
+- [ ] ✗ **头寸转出**（Position Transfer / ACATS）—— 和出金等价，最容易漏掉的一条
+- [ ] ✗ **用户管理**（添加用户、修改访问权限）—— 防止提权
+- [ ] ✗ **修改账户配置 / 申请新交易权限** —— 防止它给自己开出期权、期货权限
+- [ ] ✗ **关闭账户**
+- [ ] ✗ **税务文件 / 个人信息**
+- [ ] ✗ **期权 / 期货 / 外汇 / 加密 / 债券** 交易权限 —— 每多开一类，
+      就多一份凭据泄露后的攻击面，而策略一个都用不上
+
+**可给可不给**
+
+- [ ] 报表 / 结单**只读** —— 给了方便你单独查机器人的活动，不给也不影响运行。倾向给。
+
+#### 三个坑
+
+1. **2FA 要给新 username 单独注册一次。** IBKR Mobile 支持一台手机挂多个用户名的
+   IB Key，所以还是你那台手机。每周一次的完整重登会推给机器人用户，你点一下 ——
+   **这次点击不会踢掉你自己的主会话**，因为是两个用户。
+2. **实时行情订阅按 user 走。** 订阅挂在哪个用户名下，只有那个用户名拿得到实时价。
+   挂错了的表现是：你手机上看是实时的，机器人拿到的还是延迟 15 分钟的
+   （`IB_MARKET_DATA_TYPE=3`）—— 最难查的那种不一致。两边都要实时就得买两份。
+3. **加用户要走 IBKR 审批**，通常一两个工作日，可能要补身份信息。别排在部署当天。
+
+#### 一个 IBKR 权限管不到的地方
+
+**账户类型（现金 / 保证金）是账户级的，不是用户级的。** 你没法只给机器人一个"现金
+账户"视图 —— 它看到的 `BuyingPower` 仍然是净值的三四倍。拦住杠杆的不是 IBKR 权限，
+是这两条，上实盘前确认它们还在：
+
+- `ibkr/execution.py` 的 `MAX_ORDER_PCT_NAV = 1.0`（单笔不超过净值）
+- `prompts/agent_trader.md` 里写死的总仓位 100% 上限
+
+加上本文档 [三道实盘保护](#三道实盘保护) 那一节的 `IB_PORT` / `IB_ALLOW_LIVE` /
+`IB_READONLY`，以及 IBC `config.ini` 里的 `ReadOnlyApi=no`（机器人必须能下单，
+所以这道券商侧的只读保护对它是关着的 —— 这正是上面 username 权限要收紧的原因）。
 
 ---
 
 ## AI 自主选股（可选，风险自负）
 
-让 AI 每天收盘后自己选股、自己定仓位，第二天开盘执行。
+让 AI 每天盘前按上一交易日收盘自己选股、自己定仓位，随后开盘执行。
 
 ### 先说清楚代价
 

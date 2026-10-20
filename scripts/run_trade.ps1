@@ -25,7 +25,8 @@
 param(
     [ValidateSet("LMT","MKT")]
     [string]$OrderType = "LMT",
-    [switch]$Execute
+    [switch]$Execute,
+    [switch]$StopGatewayAfter
 )
 
 $ErrorActionPreference = "Stop"
@@ -34,6 +35,7 @@ $startedAt = Get-Date
 $root   = Split-Path -Parent $PSScriptRoot
 $python = Join-Path $root ".venv\Scripts\python.exe"
 $job    = Join-Path $root "scripts\05_daily_job.py"
+$stopGateway = Join-Path $root "scripts\ibc_stop.ps1"
 $logDir = Join-Path $root "data\logs"
 
 if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Force $logDir | Out-Null }
@@ -88,4 +90,16 @@ exit $rc
     # exit 也会走到这里。走不到的只剩硬杀（8/24 那种控制台被关），
     # 那种情况由存盘文件兜底：下次启动第一件事就是还原。
     Exit-PowerHold
+    if ($StopGatewayAfter) {
+        try {
+            Write-Log "交易阶段已结束，准备关闭 IB Gateway。"
+            & $stopGateway
+            if ($LASTEXITCODE -ne 0) {
+                Write-Log "IB Gateway 优雅关闭失败（退出码 $LASTEXITCODE），需人工查看。" "WARN"
+            }
+        } catch {
+            # 关 Gateway 失败不能覆盖交易阶段本身的退出码，但必须留痕。
+            Write-Log "IB Gateway 优雅关闭异常：$_" "WARN"
+        }
+    }
 }

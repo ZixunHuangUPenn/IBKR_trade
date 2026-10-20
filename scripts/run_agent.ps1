@@ -38,6 +38,8 @@ param(
     [double]$MaxBudgetUsd  = 3.0,
     [int]$TimeoutMinutes   = 25,
     [string]$ClaudeBin     = "",       # 留空 = 自动找
+    [int]$ClaudeRetries    = 1,        # 瞬时故障重试次数（总尝试 = 这个数 + 1）
+    [int]$RetryDelaySeconds = 60,
     [switch]$DryRun
 )
 
@@ -198,6 +200,39 @@ $kickoff = @"
     ((Get-Content $mandate -Raw -Encoding utf8) + $kickoff),
     (New-Object System.Text.UTF8Encoding($false)))
 
+# ---------------------------------------------------------- 值不值得重试
+#
+# 2026-09-14：跑了 57 分钟、花掉 $0.43、三轮之后 "API Error: Connection closed
+# mid-response"，然后直接放弃，那天没有信号。那是一次纯网络抖动，重来一次就好了。
+#
+# 但不是所有失败都该重试，分三类：
+#
+#   该重：5xx / 408 / 429 / 连接被掐断 / 没有 HTTP 状态码的网络错
+#   不该重：401、403（认证被关，重一百次也一样，只是把告警推迟一小时）
+#           其余 4xx（请求本身就不对）
+#           预算打满（重试 = 再花一份钱买同一个结果）
+#   不该重：超时（已经被 Kill 了，而且它很可能已经把提案写出来了 —— 见下面的
+#           注释；重跑会把做完的活扔掉，还可能拖过第二天开盘的交易窗口）
+#
+function Test-TransientClaudeError {
+    param($res)
+
+    $status = $res.api_error_status
+    if ($status -eq 401 -or $status -eq 403) { return $false }
+    if ($null -ne $status -and $status -ge 400 -and $status -lt 500 `
+        -and $status -ne 408 -and $status -ne 429) { return $false }
+
+    $text = ("" + $res.result + " " + $res.terminal_reason)
+    if ($text -match 'budget|Budget') { return $false }
+
+    if ($null -ne $status) { return $true }        # 5xx / 408 / 429
+
+    # 没有状态码时只能看文本。2026-09-14 那条落在 'Connection closed' 上。
+    return ($text -match 'Connection closed|connection error|network|ECONNRESET|' +
+                        'ETIMEDOUT|socket hang up|timed out|Internal server|' +
+                        'Overloaded|interrupted|incomplete')
+}
+
 $claudeArgs = @(
     "-p",
     "--model", $Model,
@@ -221,84 +256,164 @@ $claudeArgs = @(
     "--add-dir", $root
 )
 
-Write-Log "调用 claude 决策（超时 $TimeoutMinutes 分钟）…"
-$started = Get-Date
+$proposalFile = Join-Path $agentDir "proposal.json"
+$maxAttempts  = [Math]::Max(1, $ClaudeRetries + 1)
+$totalCost    = 0.0
+$attempt      = 0
+$res          = $null
+$claudeRc     = $null
+$timedOut     = $false
 
-$proc = Start-Process -FilePath $claude -ArgumentList $claudeArgs `
-    -WorkingDirectory $root -NoNewWindow -PassThru `
-    -RedirectStandardInput $promptFile `
-    -RedirectStandardOutput $stdoutFile -RedirectStandardError $stderrFile
+while ($attempt -lt $maxAttempts) {
+    $attempt++
+    $label = if ($maxAttempts -gt 1) { " (第 $attempt/$maxAttempts 次)" } else { "" }
+    Write-Log "调用 claude 决策$label（超时 $TimeoutMinutes 分钟）…"
+    $started = Get-Date
 
-# 碰一下 .Handle 才能拿到 ExitCode。
-# 不碰的话 $proc.ExitCode 是 $null，而 `$null -ne 0` 为真 ——
-# 于是每次都会报"claude 退出码非 0"，一条永远在响的假警报。
-$null = $proc.Handle
+    # 每次都从干净的回执开始。不删的话，这一次如果连 JSON 都没写出来，
+    # 下面读到的会是上一次的结果 —— 一个失败的重试会被读成成功。
+    Remove-Item $stdoutFile, $stderrFile -Force -ErrorAction SilentlyContinue
 
-$timedOut = -not $proc.WaitForExit($TimeoutMinutes * 60 * 1000)
-if ($timedOut) {
-    # 挂死的 agent 比失败的 agent 更麻烦：它会一直占着计划任务的执行槽，
-    # 明天那次就因为 MultipleInstances=IgnoreNew 而根本不启动。所以必须杀。
-    #
-    # 但杀完仍然继续走校验，不在这里 exit。
-    # 实测过一次：agent 已经把一份完全合格的提案写好了，只是收尾那几十秒
-    # 拖过了超时线 —— 直接放弃等于把做完的活扔掉。而"继续"是安全的：
-    # commit 本来就要把提案从头验一遍（含 signal_date 是不是今天），
-    # 半截的、旧的、违规的提案都过不去。
-    try { $proc.Kill() } catch { }
-    $msg = "claude 超过 $TimeoutMinutes 分钟没结束，已强制终止。仍会尝试校验已写出的提案。"
-    Write-Log $msg "WARN"
-    Send-Alert "AI 决策超时" $msg
+    $proc = Start-Process -FilePath $claude -ArgumentList $claudeArgs `
+        -WorkingDirectory $root -NoNewWindow -PassThru `
+        -RedirectStandardInput $promptFile `
+        -RedirectStandardOutput $stdoutFile -RedirectStandardError $stderrFile
+
+    # 碰一下 .Handle 才能拿到 ExitCode。
+    # 不碰的话 $proc.ExitCode 是 $null，而 `$null -ne 0` 为真 ——
+    # 于是每次都会报"claude 退出码非 0"，一条永远在响的假警报。
+    $null = $proc.Handle
+
+    $timedOut = -not $proc.WaitForExit($TimeoutMinutes * 60 * 1000)
+    if ($timedOut) {
+        # 挂死的 agent 比失败的 agent 更麻烦：它会一直占着计划任务的执行槽，
+        # 明天那次就因为 MultipleInstances=IgnoreNew 而根本不启动。所以必须杀。
+        #
+        # 但杀完仍然继续走校验，不在这里 exit，也不重试。
+        # 实测过一次：agent 已经把一份完全合格的提案写好了，只是收尾那几十秒
+        # 拖过了超时线 —— 直接放弃等于把做完的活扔掉。而"继续"是安全的：
+        # commit 本来就要把提案从头验一遍（含 signal_date 是不是今天），
+        # 半截的、旧的、违规的提案都过不去。
+        try { $proc.Kill() } catch { }
+        $msg = "claude 超过 $TimeoutMinutes 分钟没结束，已强制终止。仍会尝试校验已写出的提案。"
+        Write-Log $msg "WARN"
+        Send-Alert "AI 决策超时" $msg
+    }
+
+    $claudeRc = if ($timedOut) { "已超时终止" } else { $proc.ExitCode }
+    $elapsed = (Get-Date) - $started
+    Write-Log ("claude 结束，退出码 $claudeRc，耗时 {0:mm\:ss}" -f $elapsed)
+
+    # 解析回执。这一步和"记日志"必须分开写 —— 合在一个 try 里的话，
+    # 任何一个格式化/日志语句抛错都会走进 catch 把 $res 清成 $null，
+    # 而 $null 的 $res 在下面会被判成"claude 硬崩了，该重试"。
+    # 后果是一个明明不该重试的错误（比如 403 认证被关）被重试一遍，
+    # 既多花一次钱，又把真正的告警推迟一轮。
+    $res = $null
+    if (Test-Path $stdoutFile) {
+        try {
+            $res = Get-Content $stdoutFile -Raw -Encoding utf8 | ConvertFrom-Json
+        } catch {
+            Write-Log "解析 claude 输出失败（不影响后续，提案文件才是准的）：$_" "WARN"
+            $res = $null
+        }
+    }
+
+    # 把成本和轮数记进日志。跑上一个月你才知道这东西一年要花多少钱。
+    if ($res) {
+        try {
+            $cost = [double]$res.total_cost_usd
+            $totalCost += $cost
+            Write-Log ("本次成本 `$$([math]::Round($cost, 4))，{0} 轮，is_error={1}" -f $res.num_turns, $res.is_error)
+            # 正则要用单引号。写成 "`r?`n" 的话反引号先被 PowerShell 解释成真的
+            # CR / LF 字符，交给 -replace 的就不是 \r?\n 这个模式了。
+            if ($res.result) { Write-Log ("agent 结语：" + ($res.result -replace '\r?\n', ' | ')) }
+        } catch {
+            # 记不下成本不影响判定，$res 保持原样。
+            Write-Log "记录 claude 成本/结语失败（不影响重试判定）：$_" "WARN"
+        }
+    }
+
+    if ((Test-Path $stderrFile) -and (Get-Item $stderrFile).Length -gt 0) {
+        Write-Log ("claude stderr: " + (Get-Content $stderrFile -Raw)) "WARN"
+    }
+
+    # ---- 要不要再来一次 ----
+    if ($attempt -ge $maxAttempts -or $timedOut) { break }
+
+    # 提案已经写出来了就不重试 —— 理由和上面超时那段一样：做完的活别扔。
+    # 比时间戳而不是只看存在性，否则昨天留下的 proposal.json 会让今天永不重试。
+    $wroteProposal = (Test-Path $proposalFile) -and `
+                     ((Get-Item $proposalFile).LastWriteTime -gt $started)
+    if ($wroteProposal) {
+        if ($res -and $res.is_error) {
+            Write-Log "claude 报错退出，但提案已经写出来了 —— 不重试，交给 commit 判。" "WARN"
+        }
+        break
+    }
+
+    $reason = $null
+    if ($res -and $res.is_error) {
+        if (Test-TransientClaudeError $res) { $reason = "瞬时故障" }
+    } elseif ($null -eq $res -and $claudeRc -ne 0) {
+        # 连 JSON 都没写出来 + 非零退出 = 硬崩。给它一次机会。
+        $reason = "claude 没有产出可解析的回执"
+    }
+
+    if (-not $reason) { break }
+
+    Write-Log ("$reason，$RetryDelaySeconds 秒后重试（第 $($attempt + 1)/$maxAttempts 次）。" +
+               "累计成本 `$$([math]::Round($totalCost, 4))。") "WARN"
+    Start-Sleep -Seconds $RetryDelaySeconds
 }
 
-$claudeRc = if ($timedOut) { "已超时终止" } else { $proc.ExitCode }
-$elapsed = (Get-Date) - $started
 Remove-Item Env:\IBKR_AGENT_SANDBOX -ErrorAction SilentlyContinue
 
-Write-Log ("claude 结束，退出码 $claudeRc，耗时 {0:mm\:ss}" -f $elapsed)
-
-# 把成本和轮数记进日志。跑上一个月你才知道这东西一年要花多少钱。
-if (Test-Path $stdoutFile) {
-    try {
-        $res = Get-Content $stdoutFile -Raw -Encoding utf8 | ConvertFrom-Json
-        Write-Log ("本次成本 `$$([math]::Round($res.total_cost_usd, 4))，{0} 轮，is_error={1}" -f $res.num_turns, $res.is_error)
-        # 正则要用单引号。写成 "`r?`n" 的话反引号先被 PowerShell 解释成真的
-        # CR / LF 字符，交给 -replace 的就不是 \r?\n 这个模式了。
-        if ($res.result) { Write-Log ("agent 结语：" + ($res.result -replace '\r?\n', ' | ')) }
-
-        # "claude 自己没跑起来"和"agent 想了想决定今天不动"是两码事，但它们最后
-        # 都只表现为一件事：没有 proposal.json。于是共用 commit 那条模糊告警
-        # （"可能是它跑挂了、超时了，或者判断今天不该动"）。
-        #
-        # 2026-08-10 起那条告警连响四天，没人从里面看出来其实是订阅权限被关了
-        # （HTTP 403，num_turns=1，一分钱没花），AI 选股就这么停摆了整整一周。
-        # 信息一直在 claude 的 JSON 输出里，只是没人把它喊出来 —— 现在喊。
-        if ($res.is_error) {
-            $detail = ("" + $res.result) -replace '\r?\n', ' '
-            $status = $res.api_error_status
-            if ($status -eq 401 -or $status -eq 403) {
-                $title = "claude 认证失效，AI 选股已停摆"
-                $body  = ("claude 返回 HTTP $status，一轮都没跑起来：$detail`n`n" +
-                          "这不是策略问题，agent 根本没启动。修好之前每天都不会有信号，" +
-                          "仓位会一直停在最后一次调仓的状态。`n" +
-                          "查：跑一次 'claude setup-token' 重新生成长期 token，" +
-                          "或者在 .env 里配 ANTHROPIC_API_KEY。")
-            } elseif ($null -ne $status) {
-                $title = "claude 调用失败（HTTP $status）"
-                $body  = "claude 返回 HTTP $status：$detail`n`nagent 没有决策，今天不会有信号。"
-            } else {
-                $title = "claude 调用失败"
-                $body  = ("claude 报错退出（terminal_reason=$($res.terminal_reason)）：$detail" +
-                          "`n`nagent 没有决策，今天不会有信号。")
-            }
-            Write-Log "$title —— $detail" "ERROR"
-            Send-Alert $title $body
-        }
-    } catch {
-        Write-Log "解析 claude 输出失败（不影响后续，提案文件才是准的）：$_" "WARN"
-    }
+if ($maxAttempts -gt 1) {
+    Write-Log ("claude 共尝试 $attempt 次，累计成本 `$$([math]::Round($totalCost, 4))。")
 }
-if ((Test-Path $stderrFile) -and (Get-Item $stderrFile).Length -gt 0) {
-    Write-Log ("claude stderr: " + (Get-Content $stderrFile -Raw)) "WARN"
+
+# 告警只在所有尝试都用完之后发一次。放在循环里的话，一次"重试后成功"
+# 也会先推一条"调用失败"出去 —— 那种狼来了的告警比没有告警更糟。
+if ($res -and $res.is_error) {
+    # "claude 自己没跑起来"和"agent 想了想决定今天不动"是两码事，但它们最后
+    # 都只表现为一件事：没有 proposal.json。于是共用 commit 那条模糊告警
+    # （"可能是它跑挂了、超时了，或者判断今天不该动"）。
+    #
+    # 2026-08-10 起那条告警连响四天，没人从里面看出来其实是订阅权限被关了
+    # （HTTP 403，num_turns=1，一分钱没花），AI 选股就这么停摆了整整一周。
+    # 信息一直在 claude 的 JSON 输出里，只是没人把它喊出来 —— 现在喊。
+    $detail = ("" + $res.result) -replace '\r?\n', ' '
+    $status = $res.api_error_status
+    $tries  = if ($attempt -gt 1) { "（已重试 $($attempt - 1) 次仍失败）" } else { "" }
+
+    # claude 报错 ≠ 今天没信号：它可能在崩之前已经把提案写好了。
+    # 不区分的话，告警会言之凿凿地说"今天不会有信号"，而 commit 五秒后
+    # 就把信号落下去了 —— 说错话的告警会让人以后不再看告警。
+    $hasFresh = (Test-Path $proposalFile) -and `
+                ((Get-Item $proposalFile).LastWriteTime -gt $startedAt)
+    $outcome  = if ($hasFresh) {
+        "提案已经写出来了，交给 commit 校验 —— 今天可能仍有信号。"
+    } else {
+        "agent 没有决策，今天不会有信号。"
+    }
+    if ($status -eq 401 -or $status -eq 403) {
+        $title = "claude 认证失效，AI 选股已停摆"
+        $body  = ("claude 返回 HTTP $status，一轮都没跑起来：$detail`n`n" +
+                  "这不是策略问题，agent 根本没启动。修好之前每天都不会有信号，" +
+                  "仓位会一直停在最后一次调仓的状态。`n" +
+                  "查：跑一次 'claude setup-token' 重新生成长期 token，" +
+                  "或者在 .env 里配 ANTHROPIC_API_KEY。")
+    } elseif ($null -ne $status) {
+        $title = "claude 调用失败（HTTP $status）$tries"
+        $body  = "claude 返回 HTTP $status：$detail`n`n$outcome"
+    } else {
+        $title = "claude 调用失败$tries"
+        $body  = ("claude 报错退出（terminal_reason=$($res.terminal_reason)）：$detail" +
+                  "`n`n$outcome")
+    }
+    Write-Log "$title —— $detail" "ERROR"
+    Send-Alert $title $body
 }
 
 if ($claudeRc -ne 0) {

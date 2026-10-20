@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass, field
 
 import pandas as pd
@@ -35,6 +36,15 @@ log = logging.getLogger("ibkr.execution")
 MAX_ORDER_PCT_NAV = 1.0      # 单笔不得超过净值的 100%（无杠杆时买不了更多）
 MAX_TOTAL_TURNOVER = 2.0     # 总换手上限。2.0 = 全部清仓再全部换新，已是极限
 MAX_ORDER_VALUE = None       # 可选的绝对金额上限；None = 不限。想加保险就设个数
+
+
+def _finite(x, default: float = float("nan")) -> float:
+    """IBKR 的字段经常给 nan / None / '' —— 统一收口，别让 nan 泄进算术里。"""
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return default
+    return v if math.isfinite(v) else default
 
 
 @dataclass
@@ -270,17 +280,68 @@ def execute_plan(
     # 以 IBKR 为准复核一遍。本地状态会被"假取消"污染（见 cancel_all 的注释），
     # 一笔活着的单可能刚被我们报成 Cancelled —— 报错了比没报更危险，
     # 因为后面的对账会以为仓位已经落定。
+    #
+    # 要问 IBKR 两次，问一次不够：
+    #
+    #   reqAllOpenOrders()  只能纠正"还挂着"的单。
+    #   reqExecutions()     纠正"已经成交完了"的单 —— 这类单不在挂单列表里，
+    #                       上面那一问看不见它。
+    #
+    # 2026-09-17 就是被第二种情况打中的：四笔卖出全部收到 10349
+    # （"Order TIF was set to DAY based on order preset"，纯提示性消息），
+    # ib_async 把它们本地标成 Cancelled；实际四笔全部成交。因为已经成交，
+    # 它们也不在 reqAllOpenOrders() 里，于是日志一路写着
+    # "SELL JPM -> Cancelled 成交 0.0 股"，而仓位其实已经清掉了。
+    #
+    # 那天没出事，是因为 reconcile 从来不读这张表 —— 它自己去问 IBKR 要持仓。
+    # 所以这里修的是"回报说谎"，不是一个会亏钱的 bug。但一份会说谎的成交回报
+    # 迟早会被某个人或某段代码当真，实盘上这个代价没有上限。
     if not what_if and results:
         ib.sleep(1)
         live = {t.order.orderId: t.orderStatus.status for t in ib.reqAllOpenOrders()}
+
+        # 成交回执按 orderId 归并。一笔单可能拆成多笔 execution，要自己加总，
+        # 不能只读最后一笔的 cumQty —— 回执到达顺序不保证。
+        execs: dict[int, list] = {}
+        exec_ok = True
+        try:
+            for f in ib.reqExecutions():
+                execs.setdefault(f.execution.orderId, []).append(f.execution)
+        except Exception as e:                      # noqa: BLE001
+            # 拉不到回执就明说。这时本地状态没有被复核过，不能假装它是准的。
+            exec_ok = False
+            log.warning("拉取成交回执失败，成交数量无法复核（本地状态可能不准）：%s", e)
+
         for row in results:
             oid = row.get("order_id")
-            if oid in live and row["status"] not in ("Filled",):
+
+            # ① 成交数量和均价，以 IBKR 的回执为准
+            if exec_ok and oid in execs:
+                qty = sum(e.shares for e in execs[oid])
+                vwap = (sum(e.shares * e.price for e in execs[oid]) / qty) if qty else 0.0
+                if abs(qty - _finite(row.get("filled"), 0.0)) > 1e-6:
+                    log.warning("  %s 本地回报成交 %s 股，IBKR 回执是 %s 股 —— 以 IBKR 为准。",
+                                row["symbol"], row.get("filled"), qty)
+                row["filled"], row["avg_fill_price"] = qty, vwap
+
+            # ② 订单状态。优先级：还挂着 > 有成交回执 > 本地状态
+            filled = _finite(row.get("filled"), 0.0)
+            if oid in live:
                 if row["status"] != live[oid]:
                     log.warning("  %s 本地状态是 %s，但 IBKR 侧仍在挂单（%s）—— 以 IBKR 为准。",
                                 row["symbol"], row["status"], live[oid])
                 row["status"] = live[oid]
                 row["still_open"] = True
+            elif exec_ok and filled > 0:
+                done = ("Filled" if filled >= _finite(row.get("quantity"), 0.0) - 1e-6
+                        else "PartiallyFilled")
+                if row["status"] != done:
+                    log.warning("  %s 本地状态是 %s，但 IBKR 有成交回执（%s 股）—— 改判 %s。",
+                                row["symbol"], row["status"], filled, done)
+                row["status"] = done
+            elif exec_ok and row["status"] not in ("Filled", "PartiallyFilled"):
+                # 既不在挂单里、也没有任何成交回执 —— 这才是真的没成。
+                row["still_open"] = False
 
     df = pd.DataFrame(results)
 

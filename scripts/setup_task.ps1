@@ -1,14 +1,16 @@
 ﻿<#
 .SYNOPSIS
-    把 05_daily_job.py 注册成两个 Windows 计划任务。
+    注册盘前决策、开盘交易以及 Gateway 启停所需的四个 Windows 计划任务。
 
 .DESCRIPTION
     时点按**美东时间**填写，脚本自动换算成本机时区 —— 因为交易日历是美东的，
     而任务计划器只认本机时间。手工换算迟早会错一次，而且错的那天你不会知道。
 
-    注册两个任务：
-      <前缀>-Signal   收盘后：更新数据 + 算信号，写 data/signals/pending.json
+    注册四个任务：
+      IBC-Gateway           盘前拉起 Gateway
+      <前缀>-Signal         盘前：更新上一交易日日线 + 算信号，写 pending.json
       <前缀>-Trade    次日开盘后：读信号 + 下单 + 对账
+      IBC-Gateway-Stop      交易结束后的兜底关闭
 
     加 -Agent 的话，Signal 那一半换成 AI 自主选股（run_agent.ps1）——
     Trade 那一半完全不变，因为两者产出的是同一份 pending.json。
@@ -47,8 +49,10 @@
 param(
     [string]$Strategy     = "横截面动量",
     [string]$Params       = "",            # 例: "top_n=3 lookback=6"
-    [string]$SignalTimeET = "17:10",       # 美东收盘 16:00，留足日线结算时间
+    [string]$SignalTimeET = "08:50",       # 盘前读取上一交易日完整日线，给 agent 留 55 分钟
     [string]$TradeTimeET  = "09:45",       # 美东开盘 09:30，避开开盘前 15 分钟的乱价
+    [string]$GatewayTimeET = "08:45",      # 先拉起 Gateway，再让 signal 连
+    [string]$GatewayStopTimeET = "10:00",  # 正常已由 trade 关闭；这是启动失败时的兜底
     [switch]$Execute,                      # 不加 = Trade 阶段只预演
     [ValidateSet("LMT","MKT")]
     [string]$OrderType    = "LMT",         # 延迟行情下 LMT 常挂不上，首次验证可用 MKT
@@ -67,13 +71,17 @@ $python     = Join-Path $root ".venv\Scripts\python.exe"
 $job        = Join-Path $root "scripts\05_daily_job.py"
 $runAgent   = Join-Path $root "scripts\run_agent.ps1"
 $runTrade   = Join-Path $root "scripts\run_trade.ps1"
+$watchdog   = Join-Path $root "scripts\ibc_watchdog.ps1"
+$stopGateway = Join-Path $root "scripts\ibc_stop.ps1"
 $psExe      = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
 $signalName = "$TaskPrefix-Signal"
 $tradeName  = "$TaskPrefix-Trade"
+$gatewayName = "IBC-Gateway"
+$gatewayStopName = "IBC-Gateway-Stop"
 
 # ---------------------------------------------------------------- 拆除模式
 if ($Remove) {
-    foreach ($n in @($signalName, $tradeName)) {
+    foreach ($n in @($gatewayName, $signalName, $tradeName, $gatewayStopName)) {
         $existing = Get-ScheduledTask -TaskName $n -ErrorAction SilentlyContinue
         if ($null -ne $existing) {
             Unregister-ScheduledTask -TaskName $n -Confirm:$false
@@ -89,6 +97,8 @@ if ($Remove) {
 if (-not (Test-Path $python)) { throw "找不到虚拟环境的 python: $python" }
 if (-not (Test-Path $job))    { throw "找不到作业脚本: $job" }
 if (-not (Test-Path $runTrade)) { throw "找不到执行编排脚本: $runTrade" }
+if (-not (Test-Path $watchdog)) { throw "找不到 Gateway 看门狗: $watchdog" }
+if (-not (Test-Path $stopGateway)) { throw "找不到 Gateway 关闭脚本: $stopGateway" }
 if ($Agent -and -not (Test-Path $runAgent)) { throw "找不到 AI 编排脚本: $runAgent" }
 
 # ------------------------------------------------- 美东时间 -> 本机时间
@@ -108,6 +118,8 @@ function Convert-EtToLocal {
 
 $signalLocal = Convert-EtToLocal $SignalTimeET
 $tradeLocal  = Convert-EtToLocal $TradeTimeET
+$gatewayLocal = Convert-EtToLocal $GatewayTimeET
+$gatewayStopLocal = Convert-EtToLocal $GatewayStopTimeET
 
 # ---------------------------------------------------------------- 参数拼装
 $paramArg = ""
@@ -118,12 +130,12 @@ if ($Agent) {
     $signalExe  = $psExe
     $signalArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$runAgent`" " +
                   "-Model $Model -MaxBudgetUsd $MaxBudgetUsd"
-    $signalDesc = "IBKR 日常作业：AI 自主选股，收盘后生成目标权重信号"
+    $signalDesc = "IBKR 日常作业：AI 自主选股，盘前按上一交易日收盘生成目标权重信号"
     $stratLabel = "AI 自主选股 (model=$Model)"
 } else {
     $signalExe  = $python
     $signalArgs = "`"$job`" --stage signal --strategy `"$Strategy`"$paramArg"
-    $signalDesc = "IBKR 日常作业：收盘后更新数据并生成目标权重信号"
+    $signalDesc = "IBKR 日常作业：盘前按上一交易日收盘更新数据并生成目标权重信号"
     $stratLabel = "$Strategy $Params"
 }
 
@@ -131,6 +143,7 @@ if ($Agent) {
 # 需要一个能盖住整段 python 执行的进程来持有。交易逻辑本身一行没改。
 $tradeArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$runTrade`" -OrderType $OrderType"
 if ($Execute) { $tradeArgs += " -Execute" }
+$tradeArgs += " -StopGatewayAfter"
 
 # ---------------------------------------------------------------- 注册
 function Register-JobTask {
@@ -188,6 +201,15 @@ Register-JobTask -Name $signalName -Exe $signalExe -Arguments $signalArgs `
 Register-JobTask -Name $tradeName -Exe $psExe -Arguments $tradeArgs `
     -At $tradeLocal -Description "IBKR 日常作业：读取待执行信号，下单并对账"
 
+$gatewayArgs = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$watchdog`""
+Register-JobTask -Name $gatewayName -Exe $psExe -Arguments $gatewayArgs `
+    -At $gatewayLocal -Description "IBKR 日常作业：盘前检查并拉起 IB Gateway"
+
+$gatewayStopArgs = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$stopGateway`" " +
+                   "-WaitForTask $tradeName -WaitMinutes 90"
+Register-JobTask -Name $gatewayStopName -Exe $psExe -Arguments $gatewayStopArgs `
+    -At $gatewayStopLocal -Description "IBKR 日常作业：交易结束后兜底关闭 IB Gateway"
+
 $wakeOk = Enable-WakeTimersOnBattery
 
 # ---------------------------------------------------------------- 汇总
@@ -195,9 +217,11 @@ $mode = "预演（不下单）"
 if ($Execute) { $mode = "真实下单 / $OrderType" }
 
 Write-Host ""
-Write-Host "已注册两个计划任务：" -ForegroundColor Green
+Write-Host "已注册四个计划任务：" -ForegroundColor Green
+Write-Host ("  {0,-18} 美东 {1}  ->  本机 {2}" -f $gatewayName, $GatewayTimeET, $gatewayLocal.ToString("HH:mm"))
 Write-Host ("  {0,-14} 美东 {1}  ->  本机 {2}" -f $signalName, $SignalTimeET, $signalLocal.ToString("HH:mm"))
 Write-Host ("  {0,-14} 美东 {1}  ->  本机 {2}   [{3}]" -f $tradeName, $TradeTimeET, $tradeLocal.ToString("HH:mm"), $mode)
+Write-Host ("  {0,-18} 美东 {1}  ->  本机 {2}" -f $gatewayStopName, $GatewayStopTimeET, $gatewayStopLocal.ToString("HH:mm"))
 Write-Host ""
 Write-Host ("  策略      {0}" -f $stratLabel)
 Write-Host ("  本机时区  {0} (UTC{1:hh\:mm})" -f $localTz.Id, $localTz.BaseUtcOffset)
@@ -209,12 +233,12 @@ Write-Host "    这台机器无论如何都得保持登录状态，所以这不�
 Write-Host "  - 本机时区若不随美国一起进出夏令时，每年三月和十一月要重跑一次本脚本。"
 Write-Host "  - Gateway 的 auto-restart 时间不要落在上面两个时点附近。"
 if ($wakeOk) {
-    Write-Host "  - 已打开电池模式下的唤醒定时器，两个任务都会把机器叫醒来跑。"
+    Write-Host "  - 已打开电池模式下的唤醒定时器，早间任务会把机器叫醒来跑。"
 } else {
     Write-Host "  - 电池模式下的唤醒定时器没打开成功，电池上机器不会自己醒："  -ForegroundColor Yellow
     Write-Host "    powercfg /setdcvalueindex SCHEME_CURRENT SUB_SLEEP RTCWAKE 1" -ForegroundColor Yellow
 }
-Write-Host "  - 两个任务跑的时候都会临时把「合盖」改成不休眠，跑完立刻还原（崩了的话"
+Write-Host "  - Signal / Trade 跑的时候都会临时把「合盖」改成不休眠，跑完立刻还原（崩了的话"
 Write-Host "    下次启动第一件事就是还原）。**只动交流电那一档** —— 电池下合盖照睡，"
 Write-Host "    免得笔记本在包里空转到发烫。所以想关盖走人，记得插着电。"
 if ($Agent) {

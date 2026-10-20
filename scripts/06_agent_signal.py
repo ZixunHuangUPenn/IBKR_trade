@@ -21,7 +21,7 @@
 订单，必须先过 policy 的硬约束，再过 05 的熔断、开市检查、残单清理、对账。
 agent 那一环坏掉（幻觉、算错、被自己说服）的最坏结果是"今天不交易"。
 
-和 05 的 signal 阶段一样遵守 lag=1：今天收盘后决策，明天开盘后执行。
+和 05 的 signal 阶段一样遵守 lag=1：盘前读取上一交易日收盘，今天开盘后执行。
 理由见 05_daily_job.py 开头 —— 不遵守的话，实盘和回测的偏差往乐观方向走。
 
 退出码：0=继续  10=今天不该做事（正常跳过）  1=出问题了
@@ -523,9 +523,9 @@ def stage_commit(args) -> int:
     body = (f"信号日 {signal_date}｜换手 {payload['turnover']:.1%}｜"
             f"仓位 {sum(weights.values()):.0%}\n"
             + ("　".join(lines) if lines else "全部清仓")
-            + "\n\n明早开盘后执行。理由见 journal.jsonl")
+            + "\n\n今天开盘后执行。理由见 journal.jsonl")
     notify(f"AI 今日信号：{len(weights)} 个持仓", body)
-    log.info("信号已写入 %s，明天开盘后由 05_daily_job.py --stage trade 执行。", PENDING)
+    log.info("信号已写入 %s，今天开盘后由 05_daily_job.py --stage trade 执行。", PENDING)
     return 0
 
 
