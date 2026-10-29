@@ -25,6 +25,7 @@
 param(
     [string]$IbcPath = "C:\IBC",
     [int]$VerifySeconds = 90,   # 拉起之后等多久确认进程真的在了
+    [int]$StaleProcessMinutes = 10,
     [switch]$WhatIfOnly         # 只报告状态，不启动
 )
 
@@ -37,19 +38,44 @@ function Get-GatewayProcess {
         Where-Object { $_.CommandLine -and $_.CommandLine.Contains($marker) }
 }
 
-$running = Get-GatewayProcess
+$running = @(Get-GatewayProcess)
 $stamp   = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
 
-if ($running) {
+$portBusy = $null -ne (Get-NetTCPConnection -LocalPort 4002 -State Listen -ErrorAction SilentlyContinue)
+if ($running.Count -gt 0) {
     $pids = ($running | ForEach-Object { $_.ProcessId }) -join ","
-    Write-Output "$stamp  Gateway 在跑 (PID $pids)，无需处理"
-    exit 0
+    if ($portBusy) {
+        Write-Output "$stamp  Gateway 在跑且 4002 正常监听 (PID $pids)，无需处理"
+        exit 0
+    }
+
+    # 手工关掉 Gateway 窗口后，IBC Java 进程偶尔会残留。旧版只看进程就报成功，
+    # 结果 Agent 看到的是 ConnectionRefused。给正常登录留十分钟；超过后仍无端口，
+    # 明确判为假活，清掉残留进程再重新拉起。
+    $oldest = $running | Sort-Object CreationDate | Select-Object -First 1
+    $ageMinutes = ((Get-Date) - $oldest.CreationDate).TotalMinutes
+    if ($ageMinutes -lt $StaleProcessMinutes) {
+        Write-Output "$stamp  Gateway 进程刚启动 (PID $pids，${ageMinutes} 分钟)，4002 尚未监听；等待登录完成"
+        exit 0
+    }
+    if ($WhatIfOnly) {
+        Write-Output "$stamp  Gateway 进程假活 (PID $pids)：运行 ${ageMinutes} 分钟但 4002 未监听"
+        exit 0
+    }
+    Write-Output "$stamp  Gateway 进程假活 (PID $pids)：运行 ${ageMinutes} 分钟但 4002 未监听，正在重启"
+    $running | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    Start-Sleep -Seconds 3
 }
 
-# 端口还开着但进程没了 = 有别的东西占着 4002，这时候拉起 Gateway 只会撞车
-$portBusy = $null -ne (Get-NetTCPConnection -LocalPort 4002 -State Listen -ErrorAction SilentlyContinue)
-if ($portBusy) {
+# 端口还开着但 IBC 进程没了 = 有别的东西占着 4002，这时候拉起 Gateway 只会撞车
+elseif ($portBusy) {
     Write-Output "$stamp  IBC 进程不在，但 4002 被占用 —— 不启动，需人工确认"
+    exit 1
+}
+
+if ($portBusy -and $running.Count -eq 0) {
+    # 上面的 elseif 已处理；保留显式保护，避免以后改分支时撞端口。
+    Write-Output "$stamp  4002 被占用 —— 不启动"
     exit 1
 }
 

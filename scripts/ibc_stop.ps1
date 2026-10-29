@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     优雅关闭由 IBC 启动的 IB Gateway，并确认进程已经退出。
 
@@ -28,20 +28,22 @@ if ($WaitForTask) {
     $waitDeadline = (Get-Date).AddMinutes($WaitMinutes)
     while ((Get-Date) -lt $waitDeadline) {
         $task = Get-ScheduledTask -TaskName $WaitForTask -ErrorAction SilentlyContinue
-        if (-not $task -or $task.State -ne 'Running') { break }
+        $taskIsRunning = ($null -ne $task) -and ([string]$task.State -eq "Running")
+        if ($taskIsRunning -eq $false) { break }
         Write-Output "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')  $WaitForTask 仍在运行，等待结束后再关闭 Gateway"
         Start-Sleep -Seconds 15
     }
     $task = Get-ScheduledTask -TaskName $WaitForTask -ErrorAction SilentlyContinue
-    if ($task -and $task.State -eq 'Running') {
+    $taskIsRunning = ($null -ne $task) -and ([string]$task.State -eq "Running")
+    if ($taskIsRunning) {
         Write-Output "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')  等待 $WaitMinutes 分钟后 $WaitForTask 仍在运行，不强行关闭 Gateway"
         exit 1
     }
 }
 
-$running = Get-GatewayProcess
+$running = @(Get-GatewayProcess)
 $stamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-if (-not $running) {
+if ($running.Count -eq 0) {
     Write-Output "$stamp  Gateway 本来就没运行，无需关闭"
     exit 0
 }
@@ -56,7 +58,8 @@ Write-Output "$stamp  正在通过 IBC 优雅关闭 Gateway (PID $pids)"
 $deadline = (Get-Date).AddSeconds($VerifySeconds)
 while ((Get-Date) -lt $deadline) {
     Start-Sleep -Seconds 2
-    if (-not (Get-GatewayProcess)) {
+    $remaining = @(Get-GatewayProcess)
+    if ($remaining.Count -eq 0) {
         $stamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
         Write-Output "$stamp  Gateway 已关闭"
         exit 0

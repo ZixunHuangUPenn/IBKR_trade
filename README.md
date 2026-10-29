@@ -179,8 +179,10 @@ rebalancer.py          你原有的再平衡脚本（保留）
 你没意识到的时序偏移换来的，这种偏差最难发现，也最不可能持续。
 
 ```
-08:45  看门狗拉起 Gateway
-08:50  signal 读取上一交易日完整日线 → 算目标权重 → 写 pending.json
+06:30  看门狗拉起 Gateway（决策窗口）
+06:35  signal 读取上一交易日完整日线 → 算目标权重 → 写 pending.json
+07:00  Agent 完成后兜底关闭 Gateway
+09:35  看门狗再次拉起 Gateway（交易窗口）
 09:45  trade 撤残单 → 下单 → 对账 → 归档 → 优雅关闭 Gateway
 10:00  兜底关闭（若 trade 仍在运行则等待，绝不在交易中途强关）
 ```
@@ -194,7 +196,7 @@ rebalancer.py          你原有的再平衡脚本（保留）
 # 1. 先验证管道（跑完整流程但不写信号，因此绝不会产生交易；周末也能验）
 python scripts\05_daily_job.py --stage signal --strategy 横截面动量 --dry-run
 
-# 2. 注册四个计划任务。时点填**美东时间**，脚本自动换算成本机时区。
+# 2. 注册五个计划任务。时点填**美东时间**，脚本自动换算成本机时区。
 #    默认 trade 阶段只预演，不下单。
 .\scripts\setup_task.ps1 -Strategy 横截面动量
 
@@ -292,10 +294,12 @@ AcceptIncomingConnectionAction=accept   # 不弹 API 连接确认框
 IbLoginId= / IbPassword=                # 自己填
 ```
 
-启停都由 `setup_task.ps1` 管理：`IBC-Gateway` 每天 08:45 通过
-`scripts/ibc_watchdog.ps1` 拉起；trade 正常结束后调用 `scripts/ibc_stop.ps1`
-优雅关闭；`IBC-Gateway-Stop` 在 10:00 再兜底一次。不是每 N 分钟轮询，Gateway
-只在早间决策和交易窗口运行。看门狗失败时才按计划任务的重试策略再次尝试。
+启停都由 `setup_task.ps1` 管理：`IBC-Gateway` 每天 06:30 和 09:35 两次通过
+`scripts/ibc_watchdog.ps1` 拉起。Agent 完成后由 `IBC-Gateway-Agent-Stop` 关闭；
+trade 正常结束后调用 `scripts/ibc_stop.ps1` 优雅关闭，`IBC-Gateway-Stop` 在 10:00
+再兜底一次。不是每 N 分钟轮询，Gateway 只在决策和交易两个短窗口运行。
+看门狗失败时才按计划任务的重试策略再次尝试；若发现旧 IBC 进程存在但 4002
+超过十分钟仍未监听，会判为假活并重启，避免手工关闭窗口留下残留进程。
 
 **不能让计划任务直接跑 `StartGateway.bat`**：它内部用 `start` 派生独立窗口后立即返回，
 任务几秒就结束，`MultipleInstances=IgnoreNew` 那道防护完全落空 ——

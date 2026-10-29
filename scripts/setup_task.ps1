@@ -6,9 +6,10 @@
     时点按**美东时间**填写，脚本自动换算成本机时区 —— 因为交易日历是美东的，
     而任务计划器只认本机时间。手工换算迟早会错一次，而且错的那天你不会知道。
 
-    注册四个任务：
-      IBC-Gateway           盘前拉起 Gateway
+    注册五个任务：
+      IBC-Gateway           06:30 和交易前分别拉起 Gateway
       <前缀>-Signal         盘前：更新上一交易日日线 + 算信号，写 pending.json
+      IBC-Gateway-Agent-Stop  Agent 完成后的兜底关闭
       <前缀>-Trade    次日开盘后：读信号 + 下单 + 对账
       IBC-Gateway-Stop      交易结束后的兜底关闭
 
@@ -49,9 +50,11 @@
 param(
     [string]$Strategy     = "横截面动量",
     [string]$Params       = "",            # 例: "top_n=3 lookback=6"
-    [string]$SignalTimeET = "08:50",       # 盘前读取上一交易日完整日线，给 agent 留 55 分钟
+    [string]$SignalTimeET = "06:35",       # 06:30 拉起 Gateway 后开始盘前决策
     [string]$TradeTimeET  = "09:45",       # 美东开盘 09:30，避开开盘前 15 分钟的乱价
-    [string]$GatewayTimeET = "08:45",      # 先拉起 Gateway，再让 signal 连
+    [string]$GatewayTimeET = "06:30",      # Agent 窗口第一次拉起 Gateway
+    [string]$TradeGatewayTimeET = "09:35", # 交易前第二次拉起，避免中间被手工关闭影响
+    [string]$AgentGatewayStopTimeET = "07:00",
     [string]$GatewayStopTimeET = "10:00",  # 正常已由 trade 关闭；这是启动失败时的兜底
     [switch]$Execute,                      # 不加 = Trade 阶段只预演
     [ValidateSet("LMT","MKT")]
@@ -77,11 +80,12 @@ $psExe      = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powersh
 $signalName = "$TaskPrefix-Signal"
 $tradeName  = "$TaskPrefix-Trade"
 $gatewayName = "IBC-Gateway"
+$agentGatewayStopName = "IBC-Gateway-Agent-Stop"
 $gatewayStopName = "IBC-Gateway-Stop"
 
 # ---------------------------------------------------------------- 拆除模式
 if ($Remove) {
-    foreach ($n in @($gatewayName, $signalName, $tradeName, $gatewayStopName)) {
+    foreach ($n in @($gatewayName, $signalName, $agentGatewayStopName, $tradeName, $gatewayStopName)) {
         $existing = Get-ScheduledTask -TaskName $n -ErrorAction SilentlyContinue
         if ($null -ne $existing) {
             Unregister-ScheduledTask -TaskName $n -Confirm:$false
@@ -119,6 +123,8 @@ function Convert-EtToLocal {
 $signalLocal = Convert-EtToLocal $SignalTimeET
 $tradeLocal  = Convert-EtToLocal $TradeTimeET
 $gatewayLocal = Convert-EtToLocal $GatewayTimeET
+$tradeGatewayLocal = Convert-EtToLocal $TradeGatewayTimeET
+$agentGatewayStopLocal = Convert-EtToLocal $AgentGatewayStopTimeET
 $gatewayStopLocal = Convert-EtToLocal $GatewayStopTimeET
 
 # ---------------------------------------------------------------- 参数拼装
@@ -202,8 +208,22 @@ Register-JobTask -Name $tradeName -Exe $psExe -Arguments $tradeArgs `
     -At $tradeLocal -Description "IBKR 日常作业：读取待执行信号，下单并对账"
 
 $gatewayArgs = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$watchdog`""
-Register-JobTask -Name $gatewayName -Exe $psExe -Arguments $gatewayArgs `
-    -At $gatewayLocal -Description "IBKR 日常作业：盘前检查并拉起 IB Gateway"
+$gatewayAction = New-ScheduledTaskAction -Execute $psExe -Argument $gatewayArgs -WorkingDirectory $root
+$gatewayTriggers = @(
+    (New-ScheduledTaskTrigger -Daily -At $gatewayLocal),
+    (New-ScheduledTaskTrigger -Daily -At $tradeGatewayLocal)
+)
+$gatewaySettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -WakeToRun `
+    -RestartInterval (New-TimeSpan -Minutes 10) -RestartCount 5 `
+    -ExecutionTimeLimit (New-TimeSpan -Hours 2) -MultipleInstances IgnoreNew `
+    -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+Register-ScheduledTask -TaskName $gatewayName -Action $gatewayAction -Trigger $gatewayTriggers `
+    -Settings $gatewaySettings -Description "IBKR 日常作业：Agent 与交易前检查并拉起 IB Gateway" -Force | Out-Null
+
+$agentStopArgs = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$stopGateway`" " +
+                 "-WaitForTask $signalName -WaitMinutes 90"
+Register-JobTask -Name $agentGatewayStopName -Exe $psExe -Arguments $agentStopArgs `
+    -At $agentGatewayStopLocal -Description "IBKR 日常作业：Agent 完成后关闭 IB Gateway"
 
 $gatewayStopArgs = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$stopGateway`" " +
                    "-WaitForTask $tradeName -WaitMinutes 90"
@@ -217,9 +237,11 @@ $mode = "预演（不下单）"
 if ($Execute) { $mode = "真实下单 / $OrderType" }
 
 Write-Host ""
-Write-Host "已注册四个计划任务：" -ForegroundColor Green
+Write-Host "已注册五个计划任务：" -ForegroundColor Green
 Write-Host ("  {0,-18} 美东 {1}  ->  本机 {2}" -f $gatewayName, $GatewayTimeET, $gatewayLocal.ToString("HH:mm"))
+Write-Host ("  {0,-18} 美东 {1}  ->  本机 {2}" -f $gatewayName, $TradeGatewayTimeET, $tradeGatewayLocal.ToString("HH:mm"))
 Write-Host ("  {0,-14} 美东 {1}  ->  本机 {2}" -f $signalName, $SignalTimeET, $signalLocal.ToString("HH:mm"))
+Write-Host ("  {0,-18} 美东 {1}  ->  本机 {2}" -f $agentGatewayStopName, $AgentGatewayStopTimeET, $agentGatewayStopLocal.ToString("HH:mm"))
 Write-Host ("  {0,-14} 美东 {1}  ->  本机 {2}   [{3}]" -f $tradeName, $TradeTimeET, $tradeLocal.ToString("HH:mm"), $mode)
 Write-Host ("  {0,-18} 美东 {1}  ->  本机 {2}" -f $gatewayStopName, $GatewayStopTimeET, $gatewayStopLocal.ToString("HH:mm"))
 Write-Host ""
