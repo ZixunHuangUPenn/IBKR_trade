@@ -3,7 +3,7 @@
     注册盘前决策、开盘交易以及 Gateway 启停所需的四个 Windows 计划任务。
 
 .DESCRIPTION
-    时点按**美东时间**填写，脚本自动换算成本机时区 —— 因为交易日历是美东的，
+    时点按**美东时间**填写，脚本自动换算成本机时区；所有任务仅在周一至周五运行 —— 因为交易日历是美东的，
     而任务计划器只认本机时间。手工换算迟早会错一次，而且错的那天你不会知道。
 
     注册五个任务：
@@ -127,6 +127,22 @@ $tradeGatewayLocal = Convert-EtToLocal $TradeGatewayTimeET
 $agentGatewayStopLocal = Convert-EtToLocal $AgentGatewayStopTimeET
 $gatewayStopLocal = Convert-EtToLocal $GatewayStopTimeET
 
+function New-WeekdayTrigger {
+    param([datetime]$At)
+
+    $trigger = New-ScheduledTaskTrigger -Weekly -WeeksInterval 1 `
+        -DaysOfWeek Monday,Tuesday,Wednesday,Thursday,Friday -At $At
+
+    # New-ScheduledTaskTrigger 默认把当前 UTC 偏移写进 StartBoundary（例如 -05:00）。
+    # 在美东本机上这会把绝对时刻钉死，冬夏令时切换后任务便漂移一小时。
+    # 去掉偏移，让 Task Scheduler 把它当本地墙上时间；Windows 会跟随系统时区
+    # 自动处理 EST/EDT。非美东电脑仍使用上面的换算结果，但需在 DST 切换后重注册。
+    if ($localTz.Id -eq $etTz.Id) {
+        $trigger.StartBoundary = $At.ToString("yyyy-MM-dd'T'HH:mm:ss")
+    }
+    return $trigger
+}
+
 # ---------------------------------------------------------------- 参数拼装
 $paramArg = ""
 if ($Params -ne "") { $paramArg = " --params $Params" }
@@ -157,7 +173,7 @@ function Register-JobTask {
           [string]$Description)
 
     $action = New-ScheduledTaskAction -Execute $Exe -Argument $Arguments -WorkingDirectory $root
-    $trigger = New-ScheduledTaskTrigger -Daily -At $At
+    $trigger = New-WeekdayTrigger -At $At
 
     # StartWhenAvailable  机器当时睡着/关着，醒来后补跑（无人值守的关键）
     # WakeToRun           到点自己把机器唤醒，不用等你开盖
@@ -210,8 +226,8 @@ Register-JobTask -Name $tradeName -Exe $psExe -Arguments $tradeArgs `
 $gatewayArgs = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$watchdog`""
 $gatewayAction = New-ScheduledTaskAction -Execute $psExe -Argument $gatewayArgs -WorkingDirectory $root
 $gatewayTriggers = @(
-    (New-ScheduledTaskTrigger -Daily -At $gatewayLocal),
-    (New-ScheduledTaskTrigger -Daily -At $tradeGatewayLocal)
+    (New-WeekdayTrigger -At $gatewayLocal),
+    (New-WeekdayTrigger -At $tradeGatewayLocal)
 )
 $gatewaySettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -WakeToRun `
     -RestartInterval (New-TimeSpan -Minutes 10) -RestartCount 5 `
@@ -250,9 +266,14 @@ Write-Host ("  本机时区  {0} (UTC{1:hh\:mm})" -f $localTz.Id, $localTz.BaseU
 Write-Host ("  日志      {0}" -f (Join-Path $root "data\logs"))
 Write-Host ""
 Write-Host "注意：" -ForegroundColor Yellow
+Write-Host "  - 五个任务仅在周一至周五触发；周末不会拉起 Gateway。"
 Write-Host "  - 任务只在你登录着的时候跑。IB Gateway 本来就是 GUI 程序，"
 Write-Host "    这台机器无论如何都得保持登录状态，所以这不是额外限制。"
-Write-Host "  - 本机时区若不随美国一起进出夏令时，每年三月和十一月要重跑一次本脚本。"
+if ($localTz.Id -eq $etTz.Id) {
+    Write-Host "  - 本机是美东时区；触发器使用本地墙上时间，会自动跟随 EST/EDT 切换。"
+} else {
+    Write-Host "  - 本机不是美东时区；每年三月和十一月需重跑一次本脚本以刷新时差。"
+}
 Write-Host "  - Gateway 的 auto-restart 时间不要落在上面两个时点附近。"
 if ($wakeOk) {
     Write-Host "  - 已打开电池模式下的唤醒定时器，早间任务会把机器叫醒来跑。"

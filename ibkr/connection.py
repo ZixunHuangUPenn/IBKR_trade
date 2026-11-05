@@ -40,15 +40,24 @@ def _ensure_event_loop() -> None:
 
 
 def _attach_error_logger(ib: IB) -> None:
+    delayed_notice_logged = False
+
     def on_error(reqId, errorCode, errorString, contract):
+        nonlocal delayed_notice_logged
+
         if errorCode in _BENIGN_CODES:
             log.debug("IB[%s] %s", errorCode, errorString)
         elif errorCode == 162:
             log.warning("历史数据被拒 (162): %s —— 通常是没有该品种的行情权限，"
                         "或请求过于频繁触发限速", errorString)
+        elif errorCode == 10167 and config.MARKET_DATA_TYPE in (3, 4):
+            # 10167 在主动请求延迟/延迟冻结行情时表示 IBKR 已按预期回退。
+            # 一次请求多个标的会为每个 reqId 各发一条；只记录一次，避免刷屏。
+            if not delayed_notice_logged:
+                log.info("未订阅实时行情，当前按配置使用延迟行情（market data type=%s）",
+                         config.MARKET_DATA_TYPE)
+                delayed_notice_logged = True
         elif errorCode in (354, 10089, 10090, 10167):
-            # 10167 是"没订阅，改用延迟行情" —— 在 IB_MARKET_DATA_TYPE=3 下这正是预期行为。
-            # 把预期行为记成 ERROR，会训练出"看到 ERROR 也没事"的习惯，那才是真危险。
             log.warning("行情权限不足 (%s): %s —— 试试把 IB_MARKET_DATA_TYPE 设为 3（延迟行情）",
                         errorCode, errorString)
         elif errorCode == 200:
